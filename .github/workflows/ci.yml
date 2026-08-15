@@ -14,10 +14,44 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features remote -- -D warnings
+      - run: cargo test --features remote
       - run: cargo build --locked
       # Le binaire doit au moins répondre à un initialize MCP.
       - name: Smoke (initialize over stdio)
         run: |
           out=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' | timeout 10 target/debug/yogfile-mcp)
           echo "$out" | grep -q '"name":"yogfile"'
+
+  # Le connecteur mcp.yogfile.com : build release du binaire remote,
+  # upload SSH sur la VM API, install + restart (sudo restreint).
+  deploy-remote:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [test]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-remote
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --locked --features remote --bin yogfile-mcp-remote
+      - name: SSH setup
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Upload + install + restart
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          scp -i ~/.ssh/deploy target/release/yogfile-mcp-remote deploy@$HOST:/opt/yogfile/yogfile-mcp-remote.new
+          scp -i ~/.ssh/deploy deploy-remote.sh deploy@$HOST:/opt/yogfile/deploy-remote.sh
+          ssh -i ~/.ssh/deploy deploy@$HOST 'bash /opt/yogfile/deploy-remote.sh'
+      - name: Smoke test
+        run: curl -sf https://mcp.yogfile.com/.well-known/oauth-authorization-server | grep -q authorization_endpoint
