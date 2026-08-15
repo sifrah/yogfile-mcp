@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --locked
+      # Le binaire doit au moins répondre à un initialize MCP.
+      - name: Smoke (initialize over stdio)
+        run: |
+          out=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' | timeout 10 target/debug/yogfile-mcp)
+          echo "$out" | grep -q '"name":"yogfile"'

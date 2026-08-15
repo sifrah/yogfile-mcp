@@ -1,0 +1,29 @@
+[package]
+name = "yogfile-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Yogfile for AI agents: an MCP server that uploads files and hands back share links that expire"
+repository = "https://github.com/sifrah/yogfile-mcp"
+
+[[bin]]
+name = "yogfile-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
