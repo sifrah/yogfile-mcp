@@ -68,7 +68,8 @@ It is stateless: codes, refresh tokens and client ids are encrypted
 blobs, the access token is the Yogfile API session JWT. Environment:
 `YOGFILE_MCP_SECRET` (required, 32+ random bytes), `YOGFILE_MCP_BIND`
 (`127.0.0.1:8082`), `YOGFILE_MCP_PUBLIC_URL` (`https://mcp.yogfile.com`),
-`YOGFILE_API`, `YOGFILE_WEB`. Put it behind a TLS reverse proxy that
+`YOGFILE_API` (as seen from the server), `YOGFILE_API_PUBLIC` (as seen from
+the user's browser, default `https://api.yogfile.com`), `YOGFILE_WEB`. Put it behind a TLS reverse proxy that
 sets `X-Forwarded-For`.
 
 ## Configuration (local binary)

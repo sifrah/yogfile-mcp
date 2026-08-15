@@ -50,7 +50,11 @@ const TOKEN_CACHE: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 struct App {
+    /// L'API vue d'ici (souvent en loopback sur la même VM).
     api: String,
+    /// L'API vue du NAVIGATEUR de la personne : la page d'autorisation
+    /// crée le compte depuis chez elle, pas depuis ce serveur.
+    api_public: String,
     web: String,
     public: String,
     http: reqwest::Client,
@@ -73,6 +77,13 @@ async fn main() -> Result<()> {
         )
         .init();
     let api = std::env::var("YOGFILE_API").unwrap_or_else(|_| "https://api.yogfile.com".into());
+    let api_public = std::env::var("YOGFILE_API_PUBLIC").unwrap_or_else(|_| {
+        if api.starts_with("https://") {
+            api.clone()
+        } else {
+            "https://api.yogfile.com".into()
+        }
+    });
     let web = std::env::var("YOGFILE_WEB").unwrap_or_else(|_| "https://yogfile.com".into());
     let public = std::env::var("YOGFILE_MCP_PUBLIC_URL")
         .unwrap_or_else(|_| "https://mcp.yogfile.com".into());
@@ -87,6 +98,7 @@ async fn main() -> Result<()> {
 
     let app = App {
         api: api.trim_end_matches('/').to_string(),
+        api_public: api_public.trim_end_matches('/').to_string(),
         web: web.trim_end_matches('/').to_string(),
         public: public.trim_end_matches('/').to_string(),
         http: reqwest::Client::builder()
@@ -884,7 +896,7 @@ f.onsubmit=(e)=>{n.value=n.value.replace(/\D/g,'');if(n.value.length!==16){e.pre
         .replace("__STATE__", &esc(state))
         .replace("__CH__", &esc(challenge))
         .replace("__WEB__", &esc(&app.web))
-        .replace("__API__", &esc(&app.api))
+        .replace("__API__", &esc(&app.api_public))
 }
 
 fn render_error(msg: &str) -> String {
