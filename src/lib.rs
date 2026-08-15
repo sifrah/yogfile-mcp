@@ -81,6 +81,8 @@ pub fn tool_specs(remote: bool) -> Value {
 fn upload_spec_remote() -> Value {
     json!({
         "name": "upload_file",
+        "title": "Upload a file",
+        "annotations": { "title": "Upload a file", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "description": "Upload a file and return a stable share URL to hand to the user. \
                         This is the main tool: use it whenever you have produced something \
                         the user should be able to download or pass on — a report, code, \
@@ -106,6 +108,8 @@ fn tool_specs_local() -> Value {
     json!([
         {
             "name": "create_account",
+            "title": "Create a Yogfile account",
+            "annotations": { "title": "Create a Yogfile account", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
             "description": "Create a fresh anonymous Yogfile account and return its 16-digit \
                             number. You rarely need this: the other tools create an account by \
                             themselves on first use. Call it only when the user explicitly asks \
@@ -116,6 +120,8 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "create_box",
+            "title": "Create a box",
+            "annotations": { "title": "Create a box", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
             "description": "Create a box and return its short public name (like x7k2p9). A box \
                             is a flat folder: files live in one, and its URL shows every file it \
                             holds. Use it to group several files under a single URL for someone. \
@@ -129,6 +135,8 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "upload_file",
+            "title": "Upload a file",
+            "annotations": { "title": "Upload a file", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
             "description": "Upload a local file and return a stable share URL to hand to the \
                             user. This is the main tool: use it whenever you have produced a \
                             file the user should be able to download, instead of describing a \
@@ -149,6 +157,8 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "create_folder",
+            "title": "Create a folder",
+            "annotations": { "title": "Create a folder", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
             "description": "Create a folder inside a box and return its id. Give the full path \
                             from the box root, like 'reports/2024/q3'; every missing level is \
                             created in one call, and an existing path is returned as is rather \
@@ -161,6 +171,8 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "share_link",
+            "title": "Mint a direct download link",
+            "annotations": { "title": "Mint a direct download link", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
             "description": "Mint a short-lived signed URL that starts the download immediately, \
                             with no page in between. Prefer the stable share URL returned by \
                             upload_file when handing something to a person: it keeps working, \
@@ -174,6 +186,8 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "list_files",
+            "title": "List boxes and files",
+            "annotations": { "title": "List boxes and files", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
             "description": "List boxes, their folder tree, and the live files in them shown at \
                             their full path. \
                             Call it to find the file_id that share_link and delete_file need, to \
@@ -185,6 +199,8 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "delete_file",
+            "title": "Delete a file",
+            "annotations": { "title": "Delete a file", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false },
             "description": "Delete a file immediately and irreversibly. Its share URL and every \
                             signed link pointing at it stop working at once. There is no undo and \
                             no recycle bin, so confirm with the user before calling it on \
