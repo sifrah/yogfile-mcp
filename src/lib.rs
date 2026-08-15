@@ -8,7 +8,7 @@
 //! complet tout seul : BLAKE3 des octets (lié dans la signature du
 //! grant), PUT streamé DIRECTEMENT sur la node Nauka que le geo-DNS
 //! désigne, puis confirm — l'agent donne un chemin, il reçoit un lien
-//! de partage qui expire.
+//! de partage court, lui, qui expire.
 //!
 //! L'identité (numéro de compte à 16 chiffres) vit dans un petit état
 //! local (`~/.config/yogfile/mcp.json`), créée automatiquement au
@@ -89,9 +89,9 @@ fn upload_spec_remote() -> Value {
                         data, an image — instead of pasting it inline. Give the bytes as \
                         `content` (text) or `content_base64` (binary), or a public `url` \
                         the server fetches for you (up to 100 MB). Pass `folder` to file it \
-                        under a path like 'reports/2024/q3'. Every file expires: 7 days by \
-                        default, 30 at the most on the free plan. Tell the user when it \
-                        expires along with the URL.",
+                        under a path like 'reports/2024/q3'. Files are kept until someone \
+                        deletes them; pass `ttl_secs` only when the content is meant to \
+                        disappear on its own, and say so to the user when you do.",
         "inputSchema": { "type": "object", "properties": {
             "name": { "type": "string", "description": "file name the recipient sees, with its extension (report.md, data.csv, chart.png)" },
             "content": { "type": "string", "description": "the file's text content (UTF-8). Use content_base64 for binary" },
@@ -99,7 +99,7 @@ fn upload_spec_remote() -> Value {
             "url": { "type": "string", "description": "a public https URL to fetch the file from instead of sending its bytes" },
             "folder": { "type": "string", "description": "where to file it inside the box, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the box root" },
             "box": { "type": "string", "description": "name of an existing box; omit to use a default box, which is created on first upload" },
-            "ttl_secs": { "type": "integer", "description": "how long the file lives, in seconds (60 to 2592000, i.e. one minute to 30 days). Omit for the box default of 7 days" }
+            "ttl_secs": { "type": "integer", "description": "seconds before the file deletes itself (60 minimum). Omit — the usual case — and it is kept until deleted" }
         }, "required": ["name"] }
     })
 }
@@ -130,7 +130,7 @@ fn tool_specs_local() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "private": { "type": "boolean", "description": "require a passphrase to see the file list; a passphrase is generated if you do not supply one" },
                 "passphrase": { "type": "string" },
-                "default_ttl_secs": { "type": "integer", "description": "default lifetime of files uploaded to this box (60..2592000)" }
+                "default_ttl_secs": { "type": "integer", "description": "seconds before files in this box delete themselves (60 minimum). Omit, or 0, to keep them until deleted" }
             } }
         },
         {
@@ -144,15 +144,15 @@ fn tool_specs_local() -> Value {
                             the direct upload to the nearest node and the confirmation in one \
                             call. Pass `folder` to file it under a path like 'reports/2024/q3', \
                             which is how you keep a run's output organised instead of dumping \
-                            everything at the root. Every file expires: 7 days by default, 30 at \
-                            the most on the free plan. Tell the user when it expires along with \
-                            the URL.",
+                            everything at the root. Files are kept until someone deletes them; pass \
+                            `ttl_secs` only when the content is meant to disappear on its own, \
+                            and say so to the user when you do.",
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "local file path to read from" },
                 "folder": { "type": "string", "description": "where to file it inside the box, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the box root" },
                 "box": { "type": "string", "description": "name of an existing box; omit to use a default box, which is created on first upload" },
                 "name": { "type": "string", "description": "the name the recipient sees; omit to use the file's own name on disk" },
-                "ttl_secs": { "type": "integer", "description": "how long the file lives, in seconds (60 to 2592000, i.e. one minute to 30 days). Omit for the box default of 7 days" }
+                "ttl_secs": { "type": "integer", "description": "seconds before the file deletes itself (60 minimum). Omit — the usual case — and it is kept until deleted" }
             }, "required": ["path"] }
         },
         {
@@ -188,13 +188,14 @@ fn tool_specs_local() -> Value {
             "name": "list_files",
             "title": "List boxes and files",
             "annotations": { "title": "List boxes and files", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
-            "description": "List boxes, their folder tree, and the live files in them shown at \
-                            their full path. \
+            "description": "List boxes and what is inside them, one folder at a time. \
                             Call it to find the file_id that share_link and delete_file need, to \
                             check what is about to expire, or to see what another run left \
-                            behind in a shared box.",
+                            behind in a shared box. A folder is listed by name; pass `folder` \
+                            to walk into one. Long folders are truncated and say so.",
             "inputSchema": { "type": "object", "properties": {
-                "box": { "type": "string", "description": "restrict to one box; omit to list every box you own" }
+                "box": { "type": "string", "description": "restrict to one box; omit to list every box you own" },
+                "folder": { "type": "string", "description": "the folder to look inside, as a path like 'reports/2024'. Omit for the top level of the box" }
             } }
         },
         {
@@ -714,8 +715,25 @@ impl ApiClient {
         }
         let mut out = String::new();
         for name in boxes {
+            // Un dossier à la fois : l'API ne rend plus l'arbre entier.
+            // Elle ne peut pas — une box peut contenir des dizaines de
+            // milliers de dossiers, et les déverser dans le contexte
+            // d'un agent ne l'aiderait pas davantage que de les
+            // déverser dans un navigateur.
+            let query = match args["folder"]
+                .as_str()
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+            {
+                Some(f) => format!("?path={}", encode_path(f)),
+                None => String::new(),
+            };
             let bx = self
-                .authed(reqwest::Method::GET, &format!("/v2/boxes/{name}"), None)
+                .authed(
+                    reqwest::Method::GET,
+                    &format!("/v2/boxes/{name}{query}"),
+                    None,
+                )
                 .await?;
             out.push_str(&format!(
                 "box {name}{}\n",
@@ -725,46 +743,43 @@ impl ApiClient {
                     ""
                 }
             ));
-            // Le chemin de chaque dossier, reconstruit en remontant
-            // les parents : « f3a2… » ne dit rien à un modèle,
-            // « reports/2024 » lui permet de raisonner.
+            // Le chemin courant vient du serveur : « f3a2… » ne dit
+            // rien à un modèle, « reports/2024 » lui permet de
+            // raisonner.
             let empty = vec![];
-            let folders = bx["folders"].as_array().unwrap_or(&empty);
-            let path_of = |id: &str| -> String {
-                let mut parts = Vec::new();
-                let mut cur = Some(id.to_string());
-                while let Some(c) = cur {
-                    match folders
-                        .iter()
-                        .find(|f| f["id"].as_str() == Some(c.as_str()))
-                    {
-                        Some(f) => {
-                            parts.push(f["name"].as_str().unwrap_or("?").to_string());
-                            cur = f["parent_id"].as_str().map(str::to_string);
-                        }
-                        None => break,
-                    }
-                }
-                parts.reverse();
-                parts.join("/")
-            };
-            // Triés par CHEMIN : la base ordonne par nom, ce qui
-            // entrelace les niveaux et rend l'arbre illisible.
-            let mut paths: Vec<String> = folders
+            let here: String = bx["breadcrumbs"]
+                .as_array()
+                .unwrap_or(&empty)
                 .iter()
-                .map(|f| path_of(f["id"].as_str().unwrap_or("")))
-                .collect();
-            paths.sort();
-            for p in paths {
-                out.push_str(&format!("  {p}/\n"));
+                .filter_map(|c| c["name"].as_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            if !here.is_empty() {
+                out.push_str(&format!("  in {here}/\n"));
+            }
+            let prefix = if here.is_empty() {
+                String::new()
+            } else {
+                format!("{here}/")
+            };
+            let folders = bx["folders"].as_array().unwrap_or(&empty);
+            for f in folders {
+                out.push_str(&format!(
+                    "  {prefix}{}/\n",
+                    f["name"].as_str().unwrap_or("?")
+                ));
+            }
+            let total_folders = bx["counts"]["folders"].as_i64().unwrap_or(0);
+            if total_folders > folders.len() as i64 {
+                out.push_str(&format!(
+                    "  … {} more folders here — pass `folder` to look inside one\n",
+                    total_folders - folders.len() as i64
+                ));
             }
             match bx["files"].as_array().filter(|f| !f.is_empty()) {
                 Some(files) => {
                     for f in files {
-                        let dir = f["folder_id"]
-                            .as_str()
-                            .map(|id| format!("{}/", path_of(id)))
-                            .unwrap_or_default();
+                        let dir = prefix.clone();
                         out.push_str(&format!(
                             "  {}: {dir}{} ({} bytes, expires {})\n",
                             f["id"].as_str().unwrap_or("?"),
@@ -780,7 +795,26 @@ impl ApiClient {
         }
         Ok(out)
     }
+}
 
+/// Encode un chemin pour une query string, sans tirer une crate pour
+/// six caractères. Les noms de dossiers sont déjà validés côté API ;
+/// ce qui reste à couvrir, ce sont l'espace et les quelques signes qui
+/// changeraient le sens de l'URL.
+fn encode_path(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    for b in p.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+impl ApiClient {
     async fn delete_file(&mut self, args: &Value) -> Result<String> {
         let file_id = args["file_id"].as_str().context("file_id is required")?;
         self.authed(
