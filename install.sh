@@ -87,12 +87,14 @@ place_binary() {
     src="$1"
     if [ -w "$INSTALL_DIR" ] || mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
         mv "$src" "${INSTALL_DIR}/${BINARY}"
-    elif [ "${NO_SUDO:-0}" != "1" ] && need sudo; then
-        info "writing to ${INSTALL_DIR} (needs sudo)"
-        sudo mkdir -p "$INSTALL_DIR"
-        sudo mv "$src" "${INSTALL_DIR}/${BINARY}"
-        sudo chmod 755 "${INSTALL_DIR}/${BINARY}"
+    elif [ "${NO_SUDO:-0}" != "1" ] && need sudo \
+        && { info "writing to ${INSTALL_DIR} (needs sudo)"; sudo mkdir -p "$INSTALL_DIR" \
+             && sudo mv "$src" "${INSTALL_DIR}/${BINARY}" \
+             && sudo chmod 755 "${INSTALL_DIR}/${BINARY}"; }; then
+        :
     else
+        # Pas de droits, pas de sudo, ou sudo sans terminal (un agent qui
+        # lance l'installeur) : on retombe dans le HOME plutôt que d'échouer.
         INSTALL_DIR="${HOME}/.local/bin"
         warn "cannot write to the system directory, installing to ${INSTALL_DIR}"
         mkdir -p "$INSTALL_DIR"
