@@ -1,8 +1,12 @@
 # yogfile-mcp
 
-[Yogfile](https://yogfile.com) for AI agents: an MCP server that lets
-any agent upload files and hand back share links that expire. One
-binary, stdio, no account setup — the server provisions its own
+[Yogfile](https://yogfile.com) is a drive for AI agents: storage an
+agent writes to, reads back on the next run, and shares by URL. This
+is its MCP server. Nothing here is tied to one model or one client:
+the connector is plain MCP, and every operation behind it is a public
+HTTP API for whatever does not speak MCP.
+
+One binary, stdio, no account setup — the server provisions its own
 16-digit account on first use and keeps it in
 `~/.config/yogfile/mcp.json`.
 
@@ -11,8 +15,9 @@ binary, stdio, no account setup — the server provisions its own
 Yogfile is a hosted MCP server at `https://mcp.yogfile.com/mcp` —
 Streamable HTTP with OAuth 2.0 (dynamic client registration + PKCE),
 which is what claude.ai, Claude Desktop and Claude Code call a
-*connector*. On first use a page asks for your 16-digit Yogfile
-account number, or creates one in a click.
+*connector*. Any other MCP client takes the same URL. On first use a
+page asks for your 16-digit Yogfile account number, or creates one in
+a click.
 
 ```sh
 # Claude Code
@@ -49,17 +54,19 @@ from disk to the storage node.
 
 | Tool | What it does |
 |---|---|
-| `upload_file` | BLAKE3 the bytes, PUT them **directly** on the storage node the geo-DNS picks, confirm, and return a share link that expires (local: from a `path`; connector: from `content`/`content_base64`/`url`) |
+| `upload_file` | BLAKE3 the bytes, PUT them **directly** on the storage node the geo-DNS picks, confirm, and return a stable share link (local: from a `path`; connector: from `content`/`content_base64`/`url`) |
 | `share_link` | mint a fresh short-lived download link for a file |
 | `list_files` | list what's in a drive (folders included) |
 | `create_folder` | create a folder path in a drive |
 | `delete_file` | delete a file now |
-| `create_drive` | create a shareable drive (collection) |
+| `create_drive` | create a drive: a named place that outlives the session, holding folders and files |
 | `create_account` | local binary only: force a new account (one is created automatically otherwise) |
 
-Everything expires: 7 days by default, 30 days maximum on the free
-plan. Files never transit through the Yogfile API — the agent talks
-to the storage nodes directly with signed headers.
+Files stay until someone deletes them. A lifetime is a policy you ask
+for, not a default: `default_ttl_secs` on a drive, `ttl_secs` on a
+single upload, and a sweeper honours the date. Files never transit
+through the Yogfile API — the agent talks to the storage nodes
+directly with signed headers.
 
 ## Running the connector yourself
 
