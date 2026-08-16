@@ -97,8 +97,8 @@ fn upload_spec_remote() -> Value {
             "content": { "type": "string", "description": "the file's text content (UTF-8). Use content_base64 for binary" },
             "content_base64": { "type": "string", "description": "the file's bytes, base64-encoded" },
             "url": { "type": "string", "description": "a public https URL to fetch the file from instead of sending its bytes" },
-            "folder": { "type": "string", "description": "where to file it inside the box, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the box root" },
-            "box": { "type": "string", "description": "name of an existing box; omit to use a default box, which is created on first upload" },
+            "folder": { "type": "string", "description": "where to file it inside the drive, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the drive root" },
+            "drive": { "type": "string", "description": "name of an existing drive; omit to use a default drive, which is created on first upload" },
             "ttl_secs": { "type": "integer", "description": "seconds before the file deletes itself (60 minimum). Omit — the usual case — and it is kept until deleted" }
         }, "required": ["name"] }
     })
@@ -119,18 +119,18 @@ fn tool_specs_local() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
-            "name": "create_box",
-            "title": "Create a box",
-            "annotations": { "title": "Create a box", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
-            "description": "Create a box and return its short public name (like x7k2p9). A box \
+            "name": "create_drive",
+            "title": "Create a drive",
+            "annotations": { "title": "Create a drive", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
+            "description": "Create a drive and return its short public name (like x7k2p9). A drive \
                             is a flat folder: files live in one, and its URL shows every file it \
                             holds. Use it to group several files under a single URL for someone. \
                             For a single file you do not need this, since upload_file will place \
-                            it in a default box on its own.",
+                            it in a default drive on its own.",
             "inputSchema": { "type": "object", "properties": {
                 "private": { "type": "boolean", "description": "require a passphrase to see the file list; a passphrase is generated if you do not supply one" },
                 "passphrase": { "type": "string" },
-                "default_ttl_secs": { "type": "integer", "description": "seconds before files in this box delete themselves (60 minimum). Omit, or 0, to keep them until deleted" }
+                "default_ttl_secs": { "type": "integer", "description": "seconds before files in this drive delete themselves (60 minimum). Omit, or 0, to keep them until deleted" }
             } }
         },
         {
@@ -149,8 +149,8 @@ fn tool_specs_local() -> Value {
                             and say so to the user when you do.",
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "local file path to read from" },
-                "folder": { "type": "string", "description": "where to file it inside the box, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the box root" },
-                "box": { "type": "string", "description": "name of an existing box; omit to use a default box, which is created on first upload" },
+                "folder": { "type": "string", "description": "where to file it inside the drive, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the drive root" },
+                "drive": { "type": "string", "description": "name of an existing drive; omit to use a default drive, which is created on first upload" },
                 "name": { "type": "string", "description": "the name the recipient sees; omit to use the file's own name on disk" },
                 "ttl_secs": { "type": "integer", "description": "seconds before the file deletes itself (60 minimum). Omit — the usual case — and it is kept until deleted" }
             }, "required": ["path"] }
@@ -159,14 +159,14 @@ fn tool_specs_local() -> Value {
             "name": "create_folder",
             "title": "Create a folder",
             "annotations": { "title": "Create a folder", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
-            "description": "Create a folder inside a box and return its id. Give the full path \
-                            from the box root, like 'reports/2024/q3'; every missing level is \
+            "description": "Create a folder inside a drive and return its id. Give the full path \
+                            from the drive root, like 'reports/2024/q3'; every missing level is \
                             created in one call, and an existing path is returned as is rather \
                             than duplicated. Nesting is unlimited. You rarely need this on its \
                             own, since upload_file creates the path it is given.",
             "inputSchema": { "type": "object", "properties": {
-                "path": { "type": "string", "description": "path from the box root, e.g. 'reports/2024/q3'" },
-                "box": { "type": "string", "description": "box name; omit to use your default box" }
+                "path": { "type": "string", "description": "path from the drive root, e.g. 'reports/2024/q3'" },
+                "drive": { "type": "string", "description": "drive name; omit to use your default drive" }
             }, "required": ["path"] }
         },
         {
@@ -186,16 +186,16 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "list_files",
-            "title": "List boxes and files",
-            "annotations": { "title": "List boxes and files", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
-            "description": "List boxes and what is inside them, one folder at a time. \
+            "title": "List drives and files",
+            "annotations": { "title": "List drives and files", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+            "description": "List drives and what is inside them, one folder at a time. \
                             Call it to find the file_id that share_link and delete_file need, to \
                             check what is about to expire, or to see what another run left \
-                            behind in a shared box. A folder is listed by name; pass `folder` \
+                            behind in a shared drive. A folder is listed by name; pass `folder` \
                             to walk into one. Long folders are truncated and say so.",
             "inputSchema": { "type": "object", "properties": {
-                "box": { "type": "string", "description": "restrict to one box; omit to list every box you own" },
-                "folder": { "type": "string", "description": "the folder to look inside, as a path like 'reports/2024'. Omit for the top level of the box" }
+                "drive": { "type": "string", "description": "restrict to one drive; omit to list every drive you own" },
+                "folder": { "type": "string", "description": "the folder to look inside, as a path like 'reports/2024'. Omit for the top level of the drive" }
             } }
         },
         {
@@ -213,6 +213,14 @@ fn tool_specs_local() -> Value {
     ])
 }
 
+/// Le nom du drive passé en argument. `box` est l'ancien nom du
+/// paramètre : un agent qui a mémorisé un appel, ou un script écrit
+/// avant le renommage, continue de l'envoyer. Le lire coûte une ligne
+/// et évite un « drive not found » incompréhensible côté modèle.
+fn drive_arg(args: &Value) -> Option<&str> {
+    args["drive"].as_str().or_else(|| args["box"].as_str())
+}
+
 pub async fn call_tool(client: &mut ApiClient, name: &str, args: Value) -> Result<String> {
     match name {
         "create_account" if client.remote => Err(anyhow!(
@@ -220,7 +228,10 @@ pub async fn call_tool(client: &mut ApiClient, name: &str, args: Value) -> Resul
              connected with. Disconnect and reconnect the connector to switch accounts"
         )),
         "create_account" => client.create_account().await,
-        "create_box" => client.create_box(&args).await,
+        // `create_box` : le nom d'avant. Un agent dont la liste d'outils est
+        // figée dans un fichier de configuration l'appelle encore, et il
+        // n'a aucune raison de savoir qu'on a changé un mot.
+        "create_drive" | "create_box" => client.create_drive(&args).await,
         "create_folder" => client.create_folder(&args).await,
         "upload_file" => client.upload_file(&args).await,
         "share_link" => client.share_link(&args).await,
@@ -428,7 +439,7 @@ impl ApiClient {
         ))
     }
 
-    async fn create_box(&mut self, args: &Value) -> Result<String> {
+    async fn create_drive(&mut self, args: &Value) -> Result<String> {
         let mut body = serde_json::Map::new();
         if let Some(p) = args["private"].as_bool() {
             body.insert("private".into(), json!(p));
@@ -442,44 +453,46 @@ impl ApiClient {
         let data = self
             .authed(
                 reqwest::Method::POST,
-                "/v2/boxes",
+                "/v2/drives",
                 Some(Value::Object(body)),
             )
             .await?;
         Ok(format!(
-            "box created: {} (private: {})",
+            "drive created: {} (private: {})",
             data["name"].as_str().unwrap_or("?"),
             data["private"]
         ))
     }
 
-    /// La box par défaut : la première du compte, créée au besoin.
-    async fn default_box(&mut self) -> Result<String> {
-        let boxes = self.authed(reqwest::Method::GET, "/v2/boxes", None).await?;
-        if let Some(first) = boxes.as_array().and_then(|a| a.first()) {
+    /// Le drive par défaut : le premier du compte, créé au besoin.
+    async fn default_drive(&mut self) -> Result<String> {
+        let drives = self
+            .authed(reqwest::Method::GET, "/v2/drives", None)
+            .await?;
+        if let Some(first) = drives.as_array().and_then(|a| a.first()) {
             return Ok(first["name"].as_str().unwrap_or_default().to_string());
         }
         let data = self
-            .authed(reqwest::Method::POST, "/v2/boxes", Some(json!({})))
+            .authed(reqwest::Method::POST, "/v2/drives", Some(json!({})))
             .await?;
         Ok(data["name"].as_str().unwrap_or_default().to_string())
     }
 
     async fn create_folder(&mut self, args: &Value) -> Result<String> {
         let path = args["path"].as_str().context("path is required")?;
-        let box_name = match args["box"].as_str() {
+        let drive_name = match drive_arg(args) {
             Some(b) => b.to_string(),
-            None => self.default_box().await?,
+            None => self.default_drive().await?,
         };
         let data = self
             .authed(
                 reqwest::Method::POST,
-                &format!("/v2/boxes/{box_name}/folders"),
+                &format!("/v2/drives/{drive_name}/folders"),
                 Some(json!({ "path": path })),
             )
             .await?;
         Ok(format!(
-            "folder {} ready in box {box_name}\nfolder_id: {}",
+            "folder {} ready in drive {drive_name}\nfolder_id: {}",
             data["path"].as_str().unwrap_or(path),
             data["folder_id"].as_str().unwrap_or("?"),
         ))
@@ -583,9 +596,9 @@ impl ApiClient {
             return Err(anyhow!("{path} is not a file"));
         }
         let size = meta.len() as i64;
-        let box_name = match args["box"].as_str() {
+        let drive_name = match drive_arg(args) {
             Some(b) => b.to_string(),
-            None => self.default_box().await?,
+            None => self.default_drive().await?,
         };
 
         // 1. BLAKE3 en streaming : lié dans la signature du grant, la
@@ -623,7 +636,7 @@ impl ApiClient {
         let grant = self
             .authed(
                 reqwest::Method::POST,
-                &format!("/v2/boxes/{box_name}/uploads"),
+                &format!("/v2/drives/{drive_name}/uploads"),
                 Some(Value::Object(body)),
             )
             .await?;
@@ -662,7 +675,7 @@ impl ApiClient {
             .await?;
         let expires_at = confirmed["expires_at"].as_i64().unwrap_or(0);
         Ok(format!(
-            "uploaded: {display_name} ({size} bytes) to box {box_name}\n\
+            "uploaded: {display_name} ({size} bytes) to drive {drive_name}\n\
              share this URL with the user: {}/f/{file_id}\n\
              expires: {} ({expires_at} unix)\n\
              file_id: {file_id}",
@@ -697,10 +710,12 @@ impl ApiClient {
     }
 
     async fn list_files(&mut self, args: &Value) -> Result<String> {
-        let boxes: Vec<String> = match args["box"].as_str() {
+        let drives: Vec<String> = match drive_arg(args) {
             Some(b) => vec![b.to_string()],
             None => {
-                let all = self.authed(reqwest::Method::GET, "/v2/boxes", None).await?;
+                let all = self
+                    .authed(reqwest::Method::GET, "/v2/drives", None)
+                    .await?;
                 all.as_array()
                     .map(|a| {
                         a.iter()
@@ -710,13 +725,13 @@ impl ApiClient {
                     .unwrap_or_default()
             }
         };
-        if boxes.is_empty() {
-            return Ok("no boxes yet. upload_file creates one automatically".into());
+        if drives.is_empty() {
+            return Ok("no drives yet. upload_file creates one automatically".into());
         }
         let mut out = String::new();
-        for name in boxes {
+        for name in drives {
             // Un dossier à la fois : l'API ne rend plus l'arbre entier.
-            // Elle ne peut pas — une box peut contenir des dizaines de
+            // Elle ne peut pas — un drive peut contenir des dizaines de
             // milliers de dossiers, et les déverser dans le contexte
             // d'un agent ne l'aiderait pas davantage que de les
             // déverser dans un navigateur.
@@ -731,12 +746,12 @@ impl ApiClient {
             let bx = self
                 .authed(
                     reqwest::Method::GET,
-                    &format!("/v2/boxes/{name}{query}"),
+                    &format!("/v2/drives/{name}{query}"),
                     None,
                 )
                 .await?;
             out.push_str(&format!(
-                "box {name}{}\n",
+                "drive {name}{}\n",
                 if bx["private"].as_bool().unwrap_or(false) {
                     " (private)"
                 } else {
@@ -880,7 +895,7 @@ mod tests {
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for expected in [
             "create_account",
-            "create_box",
+            "create_drive",
             "create_folder",
             "upload_file",
             "share_link",
