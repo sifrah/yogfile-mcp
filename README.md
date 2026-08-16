@@ -51,10 +51,10 @@ from disk to the storage node.
 |---|---|
 | `upload_file` | BLAKE3 the bytes, PUT them **directly** on the storage node the geo-DNS picks, confirm, and return a share link that expires (local: from a `path`; connector: from `content`/`content_base64`/`url`) |
 | `share_link` | mint a fresh short-lived download link for a file |
-| `list_files` | list what's in a box (folders included) |
-| `create_folder` | create a folder path in a box |
+| `list_files` | list what's in a drive (folders included) |
+| `create_folder` | create a folder path in a drive |
 | `delete_file` | delete a file now |
-| `create_box` | create a shareable box (collection) |
+| `create_drive` | create a shareable drive (collection) |
 | `create_account` | local binary only: force a new account (one is created automatically otherwise) |
 
 Everything expires: 7 days by default, 30 days maximum on the free
