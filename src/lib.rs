@@ -83,10 +83,11 @@ fn upload_spec_remote() -> Value {
         "name": "upload_file",
         "title": "Upload a file",
         "annotations": { "title": "Upload a file", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
-        "description": "Upload a file and return a stable share URL to hand to the user. \
-                        This is the main tool: use it whenever you have produced something \
-                        the user should be able to download or pass on — a report, code, \
-                        data, an image — instead of pasting it inline. Give the bytes as \
+        "description": "Write a file to the user's drive and return a stable share URL. \
+                        This is the main tool, and it serves two purposes: handing the user \
+                        something they can download (a report, code, data, an image) instead \
+                        of pasting it inline, and keeping work where a later session can read \
+                        it back. What you write stays. Give the bytes as \
                         `content` (text) or `content_base64` (binary), or a public `url` \
                         the server fetches for you (up to 100 MB). Pass `folder` to file it \
                         under a path like 'reports/2024/q3'. Files are kept until someone \
@@ -99,7 +100,7 @@ fn upload_spec_remote() -> Value {
             "url": { "type": "string", "description": "a public https URL to fetch the file from instead of sending its bytes" },
             "folder": { "type": "string", "description": "where to file it inside the drive, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the drive root" },
             "drive": { "type": "string", "description": "name of an existing drive; omit to use a default drive, which is created on first upload" },
-            "ttl_secs": { "type": "integer", "description": "seconds before the file deletes itself (60 minimum). Omit — the usual case — and it is kept until deleted" }
+            "ttl_secs": { "type": "integer", "description": "a lifecycle policy for this one file: seconds before it deletes itself (60 minimum). Omit — the usual case — and it stays until deleted" }
         }, "required": ["name"] }
     })
 }
@@ -123,24 +124,27 @@ fn tool_specs_local() -> Value {
             "title": "Create a drive",
             "annotations": { "title": "Create a drive", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
             "description": "Create a drive and return its short public name (like x7k2p9). A drive \
-                            is a flat folder: files live in one, and its URL shows every file it \
-                            holds. Use it to group several files under a single URL for someone. \
+                            is a place that lasts: it holds folders and files, it survives this \
+                            session, and any later run can read it back by name, whichever model \
+                            is running. Its URL shows what is inside. Create one to keep a \
+                            project's files together or to hand a whole collection to someone. \
                             For a single file you do not need this, since upload_file will place \
                             it in a default drive on its own.",
             "inputSchema": { "type": "object", "properties": {
                 "private": { "type": "boolean", "description": "require a passphrase to see the file list; a passphrase is generated if you do not supply one" },
                 "passphrase": { "type": "string" },
-                "default_ttl_secs": { "type": "integer", "description": "seconds before files in this drive delete themselves (60 minimum). Omit, or 0, to keep them until deleted" }
+                "default_ttl_secs": { "type": "integer", "description": "a lifecycle policy for this drive: seconds before files dropped in it delete themselves (60 minimum). Omit, or 0, for the normal case where they stay until deleted" }
             } }
         },
         {
             "name": "upload_file",
             "title": "Upload a file",
             "annotations": { "title": "Upload a file", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
-            "description": "Upload a local file and return a stable share URL to hand to the \
-                            user. This is the main tool: use it whenever you have produced a \
-                            file the user should be able to download, instead of describing a \
-                            path they cannot reach. It does the content hash, the signed grant, \
+            "description": "Write a local file to the user's drive and return a stable share \
+                            URL. This is the main tool, and it serves two purposes: handing the \
+                            user something they can download instead of describing a path they \
+                            cannot reach, and keeping work where a later session can read it \
+                            back. What you write stays. It does the content hash, the signed grant, \
                             the direct upload to the nearest node and the confirmation in one \
                             call. Pass `folder` to file it under a path like 'reports/2024/q3', \
                             which is how you keep a run's output organised instead of dumping \
@@ -152,7 +156,7 @@ fn tool_specs_local() -> Value {
                 "folder": { "type": "string", "description": "where to file it inside the drive, as a path like 'reports/2024/q3'. Missing levels are created. Omit for the drive root" },
                 "drive": { "type": "string", "description": "name of an existing drive; omit to use a default drive, which is created on first upload" },
                 "name": { "type": "string", "description": "the name the recipient sees; omit to use the file's own name on disk" },
-                "ttl_secs": { "type": "integer", "description": "seconds before the file deletes itself (60 minimum). Omit — the usual case — and it is kept until deleted" }
+                "ttl_secs": { "type": "integer", "description": "a lifecycle policy for this one file: seconds before it deletes itself (60 minimum). Omit — the usual case — and it stays until deleted" }
             }, "required": ["path"] }
         },
         {
@@ -189,10 +193,11 @@ fn tool_specs_local() -> Value {
             "title": "List drives and files",
             "annotations": { "title": "List drives and files", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
             "description": "List drives and what is inside them, one folder at a time. \
-                            Call it to find the file_id that share_link and delete_file need, to \
-                            check what is about to expire, or to see what another run left \
-                            behind in a shared drive. A folder is listed by name; pass `folder` \
-                            to walk into one. Long folders are truncated and say so.",
+                            Call it to see what a previous session left behind before redoing \
+                            the work, to read a drive another agent writes to, or to find the \
+                            file_id that share_link and delete_file need. A folder is listed by \
+                            name; pass `folder` to walk into one. Long folders are truncated and \
+                            say so.",
             "inputSchema": { "type": "object", "properties": {
                 "drive": { "type": "string", "description": "restrict to one drive; omit to list every drive you own" },
                 "folder": { "type": "string", "description": "the folder to look inside, as a path like 'reports/2024'. Omit for the top level of the drive" }
@@ -238,6 +243,18 @@ pub async fn call_tool(client: &mut ApiClient, name: &str, args: Value) -> Resul
         "list_files" => client.list_files(&args).await,
         "delete_file" => client.delete_file(&args).await,
         other => Err(anyhow!("unknown tool {other}")),
+    }
+}
+
+/// Ce qu'on dit d'une échéance ABSENTE, ce qui est le cas normal
+/// depuis que rien n'expire par défaut. `expires_at` arrive alors à
+/// `null`, et le lire avec un `unwrap_or(0)` le transformait en une
+/// date de 1970 : le modèle annonçait « expires: already past » sur un
+/// fichier parfaitement vivant, et le répétait à l'utilisateur.
+fn lifetime_phrase(expires_at: Option<i64>) -> String {
+    match expires_at {
+        Some(unix) => relative_time(unix),
+        None => "kept until deleted".into(),
     }
 }
 
@@ -673,14 +690,14 @@ impl ApiClient {
                 Some(json!({ "hash": hash })),
             )
             .await?;
-        let expires_at = confirmed["expires_at"].as_i64().unwrap_or(0);
+        let expires_at = confirmed["expires_at"].as_i64();
         Ok(format!(
             "uploaded: {display_name} ({size} bytes) to drive {drive_name}\n\
              share this URL with the user: {}/f/{file_id}\n\
-             expires: {} ({expires_at} unix)\n\
+             lifetime: {}\n\
              file_id: {file_id}",
             self.web,
-            relative_time(expires_at),
+            lifetime_phrase(expires_at),
         ))
     }
 
@@ -796,11 +813,11 @@ impl ApiClient {
                     for f in files {
                         let dir = prefix.clone();
                         out.push_str(&format!(
-                            "  {}: {dir}{} ({} bytes, expires {})\n",
+                            "  {}: {dir}{} ({} bytes, {})\n",
                             f["id"].as_str().unwrap_or("?"),
                             f["name"].as_str().unwrap_or("?"),
                             f["size"],
-                            relative_time(f["expires_at"].as_i64().unwrap_or(0)),
+                            lifetime_phrase(f["expires_at"].as_i64()),
                         ));
                     }
                 }
@@ -866,6 +883,19 @@ mod tests {
         assert_eq!(relative_time(now + 3600), "in 1 hour");
         assert_eq!(relative_time(now + 90), "in 1 minute");
         assert_eq!(relative_time(now - 10), "already past");
+    }
+
+    /// Un fichier sans échéance est le cas NORMAL. Le dire « already
+    /// past » était le pire mot possible : le modèle le relayait, et
+    /// l'utilisateur apprenait que son fichier venait de mourir.
+    #[test]
+    fn a_file_without_a_lifetime_is_not_announced_as_expired() {
+        assert_eq!(lifetime_phrase(None), "kept until deleted");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(lifetime_phrase(Some(now + 604_800)), "in 7 days");
     }
 
     #[tokio::test]

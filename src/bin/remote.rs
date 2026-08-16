@@ -854,7 +854,7 @@ fn render_authorize(
 <div class="card">
   <div class="brand">__LOGO__</div>
   <h1>Connect Yogfile to __CLIENT__</h1>
-  <p>Your agent will be able to upload files and hand out share links that expire. No email, no password: a Yogfile account is a 16-digit number.</p>
+  <p>Your agent gets a drive: it can write files, read them back later, and hand out share links. No email, no password: a Yogfile account is a 16-digit number.</p>
   __ERR__
   <form method="post" action="/authorize" id="f">
     <input type="hidden" name="client_id" value="__CID__">
@@ -876,7 +876,7 @@ fn render_authorize(
       <button type="submit" class="ghost">I saved it — connect</button>
     </div>
   </form>
-  <p style="margin-top:16px"><small>By connecting you accept the <a href="__WEB__/legal/terms">terms</a>. Files expire after 7 days by default, 30 at most.</small></p>
+  <p style="margin-top:16px"><small>By connecting you accept the <a href="__WEB__/legal/terms">terms</a>. Files stay until you delete them, unless you ask for a lifetime.</small></p>
 </div>
 <script>
 const API="__API__";
