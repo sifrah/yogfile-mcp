@@ -290,6 +290,7 @@ pub struct ApiClient {
     state_path: String,
     number: Option<String>,
     token: Option<String>,
+    device_token: Option<String>,
     /// Remote : le token vient du connecteur OAuth, on ne provisionne
     /// jamais un compte tout seul et un 401 remonte tel quel (c'est au
     /// client de rafraîchir son token), et `upload_file` prend un
@@ -300,21 +301,24 @@ pub struct ApiClient {
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct LocalState {
     account_number: Option<String>,
+    #[serde(default)]
+    device_token: Option<String>,
 }
 
 impl ApiClient {
     pub fn new(base: String, web: String, state_path: String) -> Self {
-        let number = std::fs::read(&state_path)
+        let state = std::fs::read(&state_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<LocalState>(&b).ok())
-            .and_then(|s| s.account_number);
+            .unwrap_or_default();
         Self {
             base: base.trim_end_matches('/').to_string(),
             web: web.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             state_path,
-            number,
+            number: state.account_number,
             token: None,
+            device_token: state.device_token,
             remote: false,
         }
     }
@@ -329,20 +333,49 @@ impl ApiClient {
             state_path: String::new(),
             number: None,
             token: Some(token),
+            device_token: None,
             remote: true,
         }
     }
 
-    fn save_number(&self, number: &str) {
+    fn save_state(&self) {
         if let Some(dir) = std::path::Path::new(&self.state_path).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let state = LocalState {
-            account_number: Some(number.to_string()),
+            account_number: self.number.clone(),
+            device_token: self.device_token.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
-            let _ = std::fs::write(&self.state_path, bytes);
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&self.state_path)
+                {
+                    let _ = file.write_all(&bytes);
+                    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::write(&self.state_path, bytes);
+            }
         }
+    }
+
+    fn remember_authorization(&mut self, number: String, data: &Value) -> Result<String> {
+        let token = data["token"].as_str().context("no token")?.to_string();
+        self.number = Some(number);
+        self.device_token = data["device_token"].as_str().map(str::to_string);
+        self.token = Some(token.clone());
+        self.save_state();
+        Ok(token)
     }
 
     /// Extrait `data` d'une réponse API, ou transforme `error` en
@@ -390,21 +423,124 @@ impl ApiClient {
                 .as_str()
                 .context("no account_number in response")?
                 .to_string();
-            self.save_number(&number);
             self.number = Some(number);
+            self.save_state();
         }
         let number = self.number.clone().unwrap();
-        let data = Self::unwrap_api(
-            self.http
-                .post(format!("{}/v2/sessions", self.base))
-                .json(&json!({ "account_number": number }))
+        if let Some(device_token) = self.device_token.clone() {
+            let response = self
+                .http
+                .post(format!("{}/v2/sessions/refresh", self.base))
+                .json(&json!({ "device_token": device_token }))
                 .send()
-                .await?,
-        )
-        .await?;
-        let token = data["token"].as_str().context("no token")?.to_string();
-        self.token = Some(token.clone());
-        Ok(token)
+                .await?;
+            if response.status().is_success() {
+                let data = Self::unwrap_api(response).await?;
+                return self.remember_authorization(number, &data);
+            }
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+                return match Self::unwrap_api(response).await {
+                    Ok(_) => Err(anyhow!("unexpected device refresh response")),
+                    Err(error) => Err(error),
+                };
+            }
+            self.device_token = None;
+            self.save_state();
+        }
+        let response = self
+            .http
+            .post(format!("{}/v2/sessions", self.base))
+            .json(&json!({
+                "account_number": number,
+                "device_name": "Yogfile MCP",
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if !status.is_success() && body["error"]["code"] == "mfa_required" {
+            return Err(anyhow!(
+                "this account has MFA enabled. Run `yogfile-mcp auth` in a terminal to authorize this device, then restart the MCP server"
+            ));
+        }
+        if !status.is_success() {
+            let hint = body["error"]["hint"]
+                .as_str()
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "{} [{}]{hint}",
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or("request refused"),
+                body["error"]["code"].as_str().unwrap_or("unknown")
+            ));
+        }
+        self.remember_authorization(number, &body["data"])
+    }
+
+    /// Première étape du sous-commande `auth`. `None` signifie que le
+    /// numéro suffisait ; sinon l'appelant doit demander un facteur.
+    pub async fn begin_device_authorization(&mut self, number: &str) -> Result<Option<String>> {
+        let number: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
+        if number.len() != 16 {
+            return Err(anyhow!("an account number has exactly 16 digits"));
+        }
+        let response = self
+            .http
+            .post(format!("{}/v2/sessions", self.base))
+            .json(&json!({
+                "account_number": number,
+                "device_name": "Yogfile MCP",
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            self.remember_authorization(number, &body["data"])?;
+            return Ok(None);
+        }
+        if body["error"]["code"] == "mfa_required" {
+            return body["error"]["details"]["challenge_id"]
+                .as_str()
+                .map(|value| Some(value.to_string()))
+                .context("the API returned an incomplete MFA challenge");
+        }
+        Err(anyhow!(
+            "{}",
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("the account could not be opened")
+        ))
+    }
+
+    pub async fn complete_device_authorization(
+        &mut self,
+        number: &str,
+        challenge_id: &str,
+        code: &str,
+    ) -> Result<()> {
+        let normalized: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let method = if normalized.len() == 6 && normalized.bytes().all(|b| b.is_ascii_digit()) {
+            "totp"
+        } else {
+            "recovery_code"
+        };
+        let response = self
+            .http
+            .post(format!("{}/v2/sessions/mfa", self.base))
+            .json(&json!({
+                "challenge_id": challenge_id,
+                "method": method,
+                "code": code,
+                "device_name": "Yogfile MCP",
+            }))
+            .send()
+            .await?;
+        let data = Self::unwrap_api(response).await?;
+        self.remember_authorization(number.to_string(), &data)?;
+        Ok(())
     }
 
     /// Requête authentifiée avec UNE nouvelle session en cas de 401
@@ -446,8 +582,9 @@ impl ApiClient {
             .as_str()
             .context("no account_number")?
             .to_string();
-        self.save_number(&number);
         self.number = Some(number.clone());
+        self.device_token = None;
+        self.save_state();
         self.token = None;
         Ok(format!(
             "account created: {number}\nSTORE THIS NUMBER — it is the account, \

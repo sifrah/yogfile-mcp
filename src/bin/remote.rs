@@ -150,6 +150,21 @@ async fn main() -> Result<()> {
 // ───────────────────────── blobs chiffrés ─────────────────────────
 
 impl App {
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        Self {
+            api: "https://api.example".into(),
+            api_public: "https://api.example".into(),
+            web: "https://www.example".into(),
+            public: "https://mcp.example".into(),
+            http: reqwest::Client::new(),
+            cipher: Arc::new(ChaCha20Poly1305::new_from_slice(&[0u8; 32]).unwrap()),
+            used_codes: Default::default(),
+            token_cache: Default::default(),
+            auth_fails: Default::default(),
+        }
+    }
+
     /// `kind` entre dans les données authentifiées : un blob « code »
     /// ne s'ouvre pas comme un « refresh », même forgé par nous.
     fn seal<T: Serialize>(&self, kind: &str, payload: &T) -> Result<String> {
@@ -335,13 +350,21 @@ struct AuthorizeForm {
     redirect_uri: String,
     state: Option<String>,
     code_challenge: String,
+    #[serde(default)]
     account_number: String,
+    mfa_context: Option<String>,
+    mfa_code: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct CodeBlob {
-    /// Numéro de compte.
-    n: String,
+    /// Secret révocable de l'appareil OAuth, jamais le numéro.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    d: Option<String>,
+    /// Compatibilité avec les codes émis avant le MFA. Jamais écrit
+    /// dans un nouveau blob et migré vers un appareil à l'échange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n: Option<String>,
     /// sha256(client_id) : lie le code au client enregistré.
     c: String,
     r: String,
@@ -353,9 +376,39 @@ struct CodeBlob {
 
 #[derive(Serialize, Deserialize)]
 struct RefreshBlob {
-    n: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    d: Option<String>,
+    /// Refresh historique chiffré contenant le numéro. Sa première
+    /// utilisation réussie émet un nouveau refresh basé sur appareil.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n: Option<String>,
     t: i64,
     jti: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MfaBlob {
+    challenge: String,
+    c: String,
+    r: String,
+    ch: String,
+    exp: i64,
+}
+
+enum StartedSession {
+    Authorized(String),
+    MfaRequired { challenge: String, exp: i64 },
+}
+
+enum OAuthCredential {
+    Device(String),
+    LegacyNumber(String),
+}
+
+fn oauth_credential(device: Option<String>, number: Option<String>) -> Option<OAuthCredential> {
+    device
+        .map(OAuthCredential::Device)
+        .or_else(|| number.map(OAuthCredential::LegacyNumber))
 }
 
 /// Valide client_id + redirect_uri + PKCE, ou explique pourquoi non.
@@ -394,6 +447,7 @@ async fn authorize_page(State(app): State<App>, Query(q): Query<AuthorizeQuery>)
                 &challenge,
                 client.n.as_deref().unwrap_or("your MCP client"),
                 None,
+                None,
             ))
             .into_response()
         }
@@ -424,12 +478,6 @@ async fn authorize_submit(
     };
     let client: ClientBlob = app.open("client", &client_id).unwrap();
     let client_name = client.n.clone().unwrap_or_else(|| "your MCP client".into());
-    let number: String = f
-        .account_number
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
-
     // Anti-énumération : dix numéros faux par IP et par 10 minutes.
     if too_many_fails(&app, ip) {
         return (
@@ -442,31 +490,145 @@ async fn authorize_submit(
                 &challenge,
                 &client_name,
                 Some("Too many attempts from your address. Try again in ten minutes."),
+                f.mfa_context.as_deref(),
             )),
         )
             .into_response();
     }
-    if number.len() != 16 || api_session(&app, &number).await.is_err() {
-        record_fail(&app, ip);
-        return (
-            StatusCode::UNAUTHORIZED,
-            Html(render_authorize(
-                &app,
-                &client_id,
-                &redirect,
-                f.state.as_deref().unwrap_or(""),
-                &challenge,
-                &client_name,
-                Some("That account number does not exist. Check the 16 digits, or create a new account."),
-            )),
-        )
-            .into_response();
-    }
+    let device_token = if let Some(context) = f.mfa_context.as_deref() {
+        let pending: MfaBlob = match app.open::<MfaBlob>("mfa-login", context) {
+            Ok(value)
+                if value.exp >= now()
+                    && value.c == sha256_b64url(&client_id)
+                    && value.r == redirect
+                    && value.ch == challenge =>
+            {
+                value
+            }
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Html(render_authorize(
+                        &app,
+                        &client_id,
+                        &redirect,
+                        f.state.as_deref().unwrap_or(""),
+                        &challenge,
+                        &client_name,
+                        Some("This verification request expired. Start again."),
+                        None,
+                    )),
+                )
+                    .into_response()
+            }
+        };
+        let Some(code) = f
+            .mfa_code
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Html(render_authorize(
+                    &app,
+                    &client_id,
+                    &redirect,
+                    f.state.as_deref().unwrap_or(""),
+                    &challenge,
+                    &client_name,
+                    Some("Enter an authenticator or recovery code."),
+                    Some(context),
+                )),
+            )
+                .into_response();
+        };
+        match api_complete_mfa(&app, &pending.challenge, code, &client_name).await {
+            Ok(device) => device,
+            Err(_) => {
+                record_fail(&app, ip);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Html(render_authorize(
+                        &app,
+                        &client_id,
+                        &redirect,
+                        f.state.as_deref().unwrap_or(""),
+                        &challenge,
+                        &client_name,
+                        Some("That code is invalid or has already been used."),
+                        Some(context),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        let number: String = f
+            .account_number
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let started = if number.len() == 16 {
+            api_start_session(&app, &number, &client_name).await
+        } else {
+            Err(anyhow!("invalid account number"))
+        };
+        match started {
+            Ok(StartedSession::Authorized(device)) => device,
+            Ok(StartedSession::MfaRequired {
+                challenge: mfa_challenge,
+                exp,
+            }) => {
+                let context = match app.seal(
+                    "mfa-login",
+                    &MfaBlob {
+                        challenge: mfa_challenge,
+                        c: sha256_b64url(&client_id),
+                        r: redirect.clone(),
+                        ch: challenge.clone(),
+                        exp,
+                    },
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                return Html(render_authorize(
+                    &app,
+                    &client_id,
+                    &redirect,
+                    f.state.as_deref().unwrap_or(""),
+                    &challenge,
+                    &client_name,
+                    None,
+                    Some(&context),
+                ))
+                .into_response();
+            }
+            Err(_) => {
+                record_fail(&app, ip);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Html(render_authorize(
+                        &app,
+                        &client_id,
+                        &redirect,
+                        f.state.as_deref().unwrap_or(""),
+                        &challenge,
+                        &client_name,
+                        Some("That account number does not exist. Check the 16 digits, or create a new account."),
+                        None,
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    };
 
     let code = match app.seal(
         "code",
         &CodeBlob {
-            n: number,
+            d: Some(device_token),
+            n: None,
             c: sha256_b64url(&client_id),
             r: redirect.clone(),
             ch: challenge,
@@ -523,12 +685,67 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Ouvre une session API pour ce numéro : (jwt, exp).
-async fn api_session(app: &App, number: &str) -> Result<(String, i64)> {
+/// Autorise le connecteur comme appareil. Le JWT court est volontairement
+/// jeté ici : l'échange OAuth le renouvellera depuis le secret d'appareil.
+async fn api_start_session(app: &App, number: &str, client_name: &str) -> Result<StartedSession> {
     let resp = app
         .http
         .post(format!("{}/v2/sessions", app.api))
-        .json(&json!({ "account_number": number }))
+        .json(&json!({
+            "account_number": number,
+            "device_name": format!("MCP · {client_name}"),
+        }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    if body["error"]["code"] == "mfa_required" {
+        return Ok(StartedSession::MfaRequired {
+            challenge: body["error"]["details"]["challenge_id"]
+                .as_str()
+                .context("incomplete MFA challenge")?
+                .to_string(),
+            exp: body["error"]["details"]["expires_at"]
+                .as_i64()
+                .context("missing MFA challenge expiry")?,
+        });
+    }
+    if !status.is_success() {
+        return Err(anyhow!(
+            "{}",
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("session refused")
+        ));
+    }
+    let device = body["data"]["device_token"]
+        .as_str()
+        .context("no device token")?
+        .to_string();
+    Ok(StartedSession::Authorized(device))
+}
+
+async fn api_complete_mfa(
+    app: &App,
+    challenge: &str,
+    code: &str,
+    client_name: &str,
+) -> Result<String> {
+    let normalized: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let method = if normalized.len() == 6 && normalized.bytes().all(|b| b.is_ascii_digit()) {
+        "totp"
+    } else {
+        "recovery_code"
+    };
+    let resp = app
+        .http
+        .post(format!("{}/v2/sessions/mfa", app.api))
+        .json(&json!({
+            "challenge_id": challenge,
+            "method": method,
+            "code": code,
+            "device_name": format!("MCP · {client_name}"),
+        }))
         .send()
         .await?;
     let status = resp.status();
@@ -538,7 +755,32 @@ async fn api_session(app: &App, number: &str) -> Result<(String, i64)> {
             "{}",
             body["error"]["message"]
                 .as_str()
-                .unwrap_or("session refused")
+                .unwrap_or("MFA verification failed")
+        ));
+    }
+    Ok(body["data"]["device_token"]
+        .as_str()
+        .context("no device token")?
+        .to_string())
+}
+
+/// Renouvelle le JWT court sans remettre le numéro dans le refresh
+/// token OAuth.
+async fn api_device_session(app: &App, device_token: &str) -> Result<(String, i64, String)> {
+    let resp = app
+        .http
+        .post(format!("{}/v2/sessions/refresh", app.api))
+        .json(&json!({ "device_token": device_token }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        return Err(anyhow!(
+            "{}",
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("device authorization refused")
         ));
     }
     let token = body["data"]["token"]
@@ -548,7 +790,11 @@ async fn api_session(app: &App, number: &str) -> Result<(String, i64)> {
     let exp = body["data"]["expires_at"]
         .as_i64()
         .unwrap_or(now() + 24 * 3600);
-    Ok((token, exp))
+    let next_device = body["data"]["device_token"]
+        .as_str()
+        .unwrap_or(device_token)
+        .to_string();
+    Ok((token, exp, next_device))
 }
 
 // ───────────────────────── token ─────────────────────────
@@ -573,7 +819,7 @@ fn oauth_error(status: StatusCode, code: &str, desc: &str) -> Response {
 }
 
 async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
-    let number = match f.grant_type.as_str() {
+    let credential = match f.grant_type.as_str() {
         "authorization_code" => {
             let (Some(code), Some(verifier)) = (f.code.as_deref(), f.code_verifier.as_deref())
             else {
@@ -625,7 +871,14 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
                     );
                 }
             }
-            blob.n
+            let Some(credential) = oauth_credential(blob.d, blob.n) else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "authorization code has no account credential",
+                );
+            };
+            credential
         }
         "refresh_token" => {
             let Some(rt) = f.refresh_token.as_deref() else {
@@ -636,7 +889,16 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
                 );
             };
             match app.open::<RefreshBlob>("refresh", rt) {
-                Ok(b) => b.n,
+                Ok(b) => match oauth_credential(b.d, b.n) {
+                    Some(credential) => credential,
+                    None => {
+                        return oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "refresh token has no account credential",
+                        )
+                    }
+                },
                 Err(_) => {
                     return oauth_error(
                         StatusCode::BAD_REQUEST,
@@ -655,7 +917,31 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
         }
     };
 
-    let (jwt, exp) = match api_session(&app, &number).await {
+    let device_token = match credential {
+        OAuthCredential::Device(token) => token,
+        OAuthCredential::LegacyNumber(number) => {
+            match api_start_session(&app, &number, "MCP connector").await {
+                Ok(StartedSession::Authorized(token)) => token,
+                Ok(StartedSession::MfaRequired { .. }) => {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "MFA now protects this account. Reconnect the Yogfile connector",
+                    )
+                }
+                Err(error) => {
+                    tracing::warn!("legacy connector migration failed: {error}");
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "the Yogfile account is not reachable. Reconnect it",
+                    );
+                }
+            }
+        }
+    };
+
+    let (jwt, exp, next_device_token) = match api_device_session(&app, &device_token).await {
         Ok(v) => v,
         Err(e) => {
             // Le compte a disparu (ou l'API est injoignable) : le client
@@ -664,14 +950,15 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "the Yogfile account is not reachable — reconnect",
+                "the Yogfile account is not reachable. Reconnect it",
             );
         }
     };
     let refresh = match app.seal(
         "refresh",
         &RefreshBlob {
-            n: number,
+            d: Some(next_device_token),
+            n: None,
             t: now(),
             jti: random_id(),
         },
@@ -844,62 +1131,82 @@ fn render_authorize(
     challenge: &str,
     client_name: &str,
     error: Option<&str>,
+    mfa_context: Option<&str>,
 ) -> String {
     let err_html = error
         .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
         .unwrap_or_default();
+    let form = if let Some(context) = mfa_context {
+        format!(
+            r#"<div id="verify">
+      <h2>Second factor required</h2>
+      <p>Enter a code from your authenticator, or one recovery code. This authorizes the connector as a device you can revoke.</p>
+      <input type="hidden" name="mfa_context" value="{}">
+      <label for="m">Authenticator or recovery code</label>
+      <input id="m" name="mfa_code" type="password" autocomplete="one-time-code" placeholder="Code" maxlength="24" autofocus>
+      <button type="submit">Verify and connect</button>
+    </div>"#,
+            esc(context)
+        )
+    } else {
+        r#"<div id="pick">
+      <button type="button" id="create">Create a new account</button>
+      <div class="or">or use an existing one</div>
+      <label for="n">Account number</label>
+      <input id="n" name="account_number" type="password" inputmode="numeric" autocomplete="off" placeholder="16 digits" maxlength="16">
+      <button type="submit" class="ghost" id="go">Connect</button>
+    </div>
+    <div id="made" class="hide">
+      <label>Your new account</label>
+      <div class="num" id="num"></div>
+      <p class="warn">Save the number now. It is never shown in full on screen, and there is no email recovery. MFA stays off until you add it in Yogfile settings.</p>
+      <button type="button" id="copy">Copy number</button>
+      <button type="submit" class="ghost">I saved it, connect</button>
+    </div>"#
+            .to_string()
+    };
     let tpl = r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Connect Yogfile</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600&display=swap" rel="stylesheet"><style>__CSS__</style></head><body>
 <div class="card">
   <div class="brand">__LOGO__</div>
   <h1>Connect Yogfile to __CLIENT__</h1>
-  <p>Your agent gets a drive: it can write files, read them back later, and hand out share links. No email, no password: a Yogfile account is a 16-digit number.</p>
+  <p>Your agent gets a drive: it can write files, read them back later, and hand out share links. No email or password. A Yogfile account starts with a private 16-digit number and can be protected by MFA.</p>
   __ERR__
   <form method="post" action="/authorize" id="f">
     <input type="hidden" name="client_id" value="__CID__">
     <input type="hidden" name="redirect_uri" value="__REDIR__">
     <input type="hidden" name="state" value="__STATE__">
     <input type="hidden" name="code_challenge" value="__CH__">
-    <div id="pick">
-      <button type="button" id="create">Create a new account</button>
-      <div class="or">or use an existing one</div>
-      <label for="n">Account number</label>
-      <input id="n" name="account_number" inputmode="numeric" autocomplete="off" placeholder="16 digits" maxlength="19">
-      <button type="submit" class="ghost" id="go">Connect</button>
-    </div>
-    <div id="made" class="hide">
-      <label>Your new account number</label>
-      <div class="num" id="num"></div>
-      <p class="warn">Save it now. It is the account: there is no email, no reset, no recovery. It is also stored by __CLIENT__ for this connection.</p>
-      <button type="button" id="copy">Copy number</button>
-      <button type="submit" class="ghost">I saved it — connect</button>
-    </div>
+    __FORM__
   </form>
   <p style="margin-top:16px"><small>By connecting you accept the <a href="__WEB__/legal/terms">terms</a>. Files stay until you delete them, unless you ask for a lifetime.</small></p>
 </div>
 <script>
 const API="__API__";
 const f=document.getElementById('f'),n=document.getElementById('n');
-document.getElementById('create').onclick=async(e)=>{
+const create=document.getElementById('create');
+if(create)create.onclick=async(e)=>{
   const b=e.target;b.disabled=true;b.textContent='Creating…';
   try{
     const r=await fetch(API+'/v2/accounts',{method:'POST'});
     const j=await r.json();
     if(!r.ok||!j.data){throw new Error((j.error&&j.error.message)||'could not create an account');}
     n.value=j.data.account_number;
-    document.getElementById('num').textContent=j.data.account_number.replace(/(\d{4})(?=\d)/g,'$1 ');
+    document.getElementById('num').textContent='•••• •••• •••• '+j.data.account_number.slice(-4);
     document.getElementById('pick').classList.add('hide');
     document.getElementById('made').classList.remove('hide');
   }catch(err){alert(err.message);b.disabled=false;b.textContent='Create a new account';}
 };
-document.getElementById('copy').onclick=(e)=>{navigator.clipboard.writeText(n.value).then(()=>{e.target.textContent='Copied';});};
-f.onsubmit=(e)=>{n.value=n.value.replace(/\D/g,'');if(n.value.length!==16){e.preventDefault();alert('An account number has 16 digits.');}};
+const copy=document.getElementById('copy');
+if(copy)copy.onclick=(e)=>{navigator.clipboard.writeText(n.value).then(()=>{e.target.textContent='Copied';});};
+f.onsubmit=(e)=>{if(n){n.value=n.value.replace(/\D/g,'');if(n.value.length!==16){e.preventDefault();alert('An account number has 16 digits.');}}};
 </script></body></html>"#;
     tpl.replace("__CSS__", PAGE_CSS)
         .replace("__LOGO__", LOGO_SVG)
         .replace("__CLIENT__", &esc(client_name))
         .replace("__ERR__", &err_html)
+        .replace("__FORM__", &form)
         .replace("__CID__", &esc(client_id))
         .replace("__REDIR__", &esc(redirect))
         .replace("__STATE__", &esc(state))
@@ -915,4 +1222,67 @@ fn render_error(msg: &str) -> String {
         LOGO_SVG,
         esc(msg)
     )
+}
+
+#[cfg(test)]
+mod mfa_tests {
+    use super::*;
+
+    #[test]
+    fn oauth_sealed_values_never_contain_an_account_number_field() {
+        let code = serde_json::to_value(CodeBlob {
+            d: Some("ydt_secret".into()),
+            n: None,
+            c: "client".into(),
+            r: "https://client.example/callback".into(),
+            ch: "pkce".into(),
+            exp: 1,
+            jti: "one".into(),
+        })
+        .unwrap();
+        let refresh = serde_json::to_value(RefreshBlob {
+            d: Some("ydt_secret".into()),
+            n: None,
+            t: 1,
+            jti: "two".into(),
+        })
+        .unwrap();
+
+        assert!(code.get("n").is_none());
+        assert!(refresh.get("n").is_none());
+        assert_eq!(code["d"], "ydt_secret");
+    }
+
+    #[test]
+    fn legacy_refreshes_are_readable_for_one_way_migration() {
+        let legacy: RefreshBlob = serde_json::from_value(json!({
+            "n": "legacy-number",
+            "t": 1,
+            "jti": "old",
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            oauth_credential(legacy.d, legacy.n),
+            Some(OAuthCredential::LegacyNumber(value)) if value == "legacy-number"
+        ));
+    }
+
+    #[test]
+    fn mfa_page_has_only_a_hidden_factor_input() {
+        let app = App::for_tests();
+        let html = render_authorize(
+            &app,
+            "client",
+            "https://client.example/callback",
+            "state",
+            "pkce",
+            "Test client",
+            None,
+            Some("sealed-context"),
+        );
+
+        assert!(html.contains("name=\"mfa_code\" type=\"password\""));
+        assert!(!html.contains("name=\"account_number\""));
+    }
 }
