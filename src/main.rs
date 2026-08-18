@@ -1,9 +1,9 @@
 //! yogfile-mcp — le serveur MCP stdio (JSON-RPC 2.0, un message par
 //! ligne) : le binaire qu'un client MCP lance sur la machine de
-//! l'agent. L'identité (numéro de compte à 16 chiffres) vit dans un
-//! petit état local (`~/.config/yogfile/mcp.json`), créée
-//! automatiquement au premier besoin : un agent se provisionne sans
-//! aucun humain dans la boucle. C'est le produit.
+//! l'agent. L'identité et l'autorisation révocable de cet appareil
+//! vivent dans `~/.config/yogfile/mcp.json`. `yogfile-mcp auth`
+//! enrôle une fois un compte protégé par MFA sans mettre ses secrets
+//! dans l'historique du shell.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -23,6 +23,28 @@ async fn main() -> Result<()> {
         )
     });
     let mut client = ApiClient::new(api, web, state_path);
+
+    if std::env::args().nth(1).as_deref() == Some("auth") {
+        let number = rpassword::prompt_password("Yogfile account number (input hidden): ")?;
+        if let Some(challenge) = client.begin_device_authorization(&number).await? {
+            let code =
+                rpassword::prompt_password("Authenticator or recovery code (input hidden): ")?;
+            client
+                .complete_device_authorization(&number, &challenge, &code)
+                .await?;
+        }
+        let suffix: String = number
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        println!("Yogfile MCP is authorized for the account ending in {suffix}.");
+        return Ok(());
+    }
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
