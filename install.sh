@@ -68,19 +68,28 @@ verify_checksum() {
     file="$1"; sums="$2"; name="$3"
     expected="$(grep " \{1,2\}\*\?${name}\$" "$sums" 2>/dev/null | awk '{print $1}' | head -1)"
     if [ -z "$expected" ]; then
-        warn "no checksum published for ${name}, skipping verification"
-        return 0
+        die "no checksum published for ${name} — refusing to install"
     fi
     if need sha256sum; then
         actual="$(sha256sum "$file" | awk '{print $1}')"
     elif need shasum; then
         actual="$(shasum -a 256 "$file" | awk '{print $1}')"
     else
-        warn "no sha256 tool found, skipping verification"
-        return 0
+        die "no SHA-256 tool found — refusing to install"
     fi
     [ "$actual" = "$expected" ] || die "checksum mismatch for ${name} — refusing to install"
     info "checksum verified"
+}
+
+verify_attestation() {
+    file="$1"; version="$2"
+    need gh || die "GitHub CLI is required to verify release provenance (install gh, then retry)"
+    gh attestation verify "$file" \
+        --repo "$REPO" \
+        --signer-workflow "${REPO}/.github/workflows/release.yml" \
+        --source-ref "refs/tags/${version}" >/dev/null \
+        || die "release provenance verification failed — refusing to install"
+    info "GitHub build provenance verified"
 }
 
 place_binary() {
@@ -118,11 +127,10 @@ main() {
     fetch "${base}/${tarball}" "${tmpdir}/${tarball}" \
         || die "download failed — no build for ${target} in ${version}?"
 
-    if fetch "${base}/SHA256SUMS.txt" "${tmpdir}/SHA256SUMS.txt" 2>/dev/null; then
-        verify_checksum "${tmpdir}/${tarball}" "${tmpdir}/SHA256SUMS.txt" "$tarball"
-    else
-        warn "checksums unavailable, skipping verification"
-    fi
+    fetch "${base}/SHA256SUMS.txt" "${tmpdir}/SHA256SUMS.txt" 2>/dev/null \
+        || die "checksums unavailable — refusing to install"
+    verify_checksum "${tmpdir}/${tarball}" "${tmpdir}/SHA256SUMS.txt" "$tarball"
+    verify_attestation "${tmpdir}/${tarball}" "$version"
 
     tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir"
     found="$(find "$tmpdir" -type f -name "$BINARY" -perm -u+x | head -1)"
