@@ -4,15 +4,29 @@ on:
   pull_request:
 env:
   CARGO_TERM_COLOR: always
+permissions:
+  contents: read
 jobs:
+  audit:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --features remote -- -D warnings
       - run: cargo test --features remote
@@ -27,15 +41,15 @@ jobs:
   # upload SSH sur la VM API, install + restart (sudo restreint).
   deploy-remote:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [test]
+    needs: [audit, test]
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-remote
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build release
         run: cargo build --release --locked --features remote --bin yogfile-mcp-remote
       - name: SSH setup

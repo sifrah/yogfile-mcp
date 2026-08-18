@@ -17,8 +17,135 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+const MAX_REMOTE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_REMOTE_REDIRECTS: usize = 3;
+
+/// Le connecteur distant télécharge parfois une URL fournie par un
+/// utilisateur. Elle ne doit jamais devenir un tunnel vers la machine,
+/// le réseau privé ou le service de métadonnées de l'hébergeur.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => is_public_ipv6(ip),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, d] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224
+        || (a == 255 && b == 255 && c == 255 && d == 255))
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    // Les formes IPv4-mapped héritent du verdict IPv4. Le test doit
+    // précéder la restriction 2000::/3 ci-dessous.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_public_ipv4(v4);
+    }
+    let segments = ip.segments();
+    // N'accepter que l'espace unicast global actuellement routable.
+    // Cela exclut notamment les préfixes NAT64 et toutes les plages
+    // spéciales futures tant qu'elles ne sont pas explicitement auditées.
+    if (segments[0] & 0xe000) != 0x2000 {
+        return false;
+    }
+    // Documentation, benchmark, Teredo et 6to4 ne sont jamais suivis ici.
+    // Ces deux derniers pourraient encapsuler une IPv4 privée.
+    if (segments[0] == 0x2001 && (segments[1] == 0 || segments[1] == 0x0db8))
+        || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+        || segments[0] == 0x2002
+    {
+        return false;
+    }
+    true
+}
+
+async fn public_fetch_client(url: &reqwest::Url) -> Result<reqwest::Client> {
+    if url.scheme() != "https" {
+        return Err(anyhow!("url must use https"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!("url credentials are not allowed"));
+    }
+    let host = url.host_str().context("url must have a host")?;
+    let port = url
+        .port_or_known_default()
+        .context("url must have a port")?;
+    if port != 443 {
+        return Err(anyhow!("url must use the standard https port 443"));
+    }
+    let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![SocketAddr::new(ip, port)],
+        Err(_) => tokio::net::lookup_host((host, port))
+            .await
+            .with_context(|| format!("resolving {host}"))?
+            .collect(),
+    };
+    if addrs.is_empty() || addrs.iter().any(|addr| !is_public_ip(addr.ip())) {
+        return Err(anyhow!(
+            "url must resolve only to public Internet addresses"
+        ));
+    }
+    reqwest::Client::builder()
+        // On épingle les résultats validés : une seconde résolution entre
+        // le contrôle et la connexion rouvrirait un DNS rebinding.
+        .resolve_to_addrs(host, &addrs)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .user_agent(format!("yogfile-mcp-remote/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building the isolated URL fetcher")
+}
+
+async fn fetch_public_url(raw: &str) -> Result<reqwest::Response> {
+    let mut url = reqwest::Url::parse(raw).context("url is not valid")?;
+    for redirects in 0..=MAX_REMOTE_REDIRECTS {
+        let client = public_fetch_client(&url).await?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?;
+        if response.status().is_redirection() {
+            if redirects == MAX_REMOTE_REDIRECTS {
+                return Err(anyhow!("url redirected too many times"));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("redirect has no Location header")?
+                .to_str()
+                .context("redirect Location is not valid text")?;
+            url = url
+                .join(location)
+                .context("redirect Location is not a valid URL")?;
+            continue;
+        }
+        return Ok(response);
+    }
+    unreachable!()
+}
 
 /// Route un message JSON-RPC. Les notifications ne répondent rien.
 pub async fn handle(client: &mut ApiClient, msg: &Value) -> Option<Value> {
@@ -111,12 +238,12 @@ fn tool_specs_local() -> Value {
             "name": "create_account",
             "title": "Create a Yogfile account",
             "annotations": { "title": "Create a Yogfile account", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false },
-            "description": "Create a fresh anonymous Yogfile account and return its 16-digit \
-                            number. You rarely need this: the other tools create an account by \
+            "description": "Create a fresh anonymous Yogfile account. You rarely need this: \
+                            the other tools create an account by \
                             themselves on first use. Call it only when the user explicitly asks \
-                            to start over with a new account. The number is saved locally and is \
-                            the ONLY credential: if it is lost the account cannot be recovered, \
-                            so show it to the user when it is created.",
+                            to start over with a new account. The complete recovery number is \
+                            saved only in Yogfile's private local state and is never returned to \
+                            the agent conversation. Tell the user where to retrieve it locally.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -338,35 +465,48 @@ impl ApiClient {
         }
     }
 
-    fn save_state(&self) {
-        if let Some(dir) = std::path::Path::new(&self.state_path).parent() {
-            let _ = std::fs::create_dir_all(dir);
+    fn save_state(&self) -> Result<()> {
+        if self.state_path.is_empty() {
+            return Ok(());
         }
+        let path = std::path::Path::new(&self.state_path);
+        let dir = path.parent().context("the MCP state path has no parent")?;
+        std::fs::create_dir_all(dir).context("creating the MCP state directory")?;
         let state = LocalState {
             account_number: self.number.clone(),
             device_token: self.device_token.clone(),
         };
-        if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&self.state_path)
-                {
-                    let _ = file.write_all(&bytes);
-                    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = std::fs::write(&self.state_path, bytes);
-            }
+        let bytes = serde_json::to_vec_pretty(&state)?;
+        use std::io::Write;
+        let mut temporary = tempfile::NamedTempFile::new_in(dir)
+            .context("creating a private temporary MCP state")?;
+        #[cfg(unix)]
+        temporary
+            .as_file()
+            .set_permissions({
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::Permissions::from_mode(0o600)
+            })
+            .context("protecting the temporary MCP state")?;
+        temporary
+            .write_all(&bytes)
+            .context("writing the MCP state")?;
+        temporary.flush().context("flushing the MCP state")?;
+        temporary
+            .as_file()
+            .sync_all()
+            .context("syncing the MCP state")?;
+        temporary
+            .persist(path)
+            .map_err(|error| error.error)
+            .context("atomically replacing the MCP state")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .context("protecting the MCP state")?;
         }
+        Ok(())
     }
 
     fn remember_authorization(&mut self, number: String, data: &Value) -> Result<String> {
@@ -374,7 +514,7 @@ impl ApiClient {
         self.number = Some(number);
         self.device_token = data["device_token"].as_str().map(str::to_string);
         self.token = Some(token.clone());
-        self.save_state();
+        self.save_state()?;
         Ok(token)
     }
 
@@ -424,7 +564,7 @@ impl ApiClient {
                 .context("no account_number in response")?
                 .to_string();
             self.number = Some(number);
-            self.save_state();
+            self.save_state()?;
         }
         let number = self.number.clone().unwrap();
         if let Some(device_token) = self.device_token.clone() {
@@ -445,7 +585,7 @@ impl ApiClient {
                 };
             }
             self.device_token = None;
-            self.save_state();
+            self.save_state()?;
         }
         let response = self
             .http
@@ -584,11 +724,13 @@ impl ApiClient {
             .to_string();
         self.number = Some(number.clone());
         self.device_token = None;
-        self.save_state();
+        self.save_state()?;
         self.token = None;
+        let suffix = &number[number.len() - 4..];
         Ok(format!(
-            "account created: {number}\nSTORE THIS NUMBER — it is the account, \
-             there is no recovery. It is also saved in {} for this server's future calls.",
+            "account created: •••• •••• •••• {suffix}\nThe full recovery number was saved \
+             with the connector's private state at {}. Open that file yourself, outside the \
+             AI conversation, and store the number safely. It will never be printed here.",
             self.state_path
         ))
     }
@@ -674,7 +816,6 @@ impl ApiClient {
     /// puis c'est le même chemin que le binaire local — hash, grant,
     /// PUT streamé vers la node, confirm.
     async fn upload_file_remote(&mut self, args: &Value) -> Result<String> {
-        const MAX_REMOTE_BYTES: u64 = 100 * 1024 * 1024;
         let name = args["name"]
             .as_str()
             .map(str::trim)
@@ -684,28 +825,24 @@ impl ApiClient {
         let tmp = tempfile::NamedTempFile::new().context("temp file")?;
         let path = tmp.path().to_path_buf();
         if let Some(text) = args["content"].as_str() {
+            if text.len() as u64 > MAX_REMOTE_BYTES {
+                return Err(anyhow!("content is over the 100 MB connector limit"));
+            }
             tokio::fs::write(&path, text.as_bytes()).await?;
         } else if let Some(b64) = args["content_base64"].as_str() {
             use base64::Engine;
-            let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+            // Ne pas dupliquer une chaîne qui peut déjà mesurer 134 Mio.
+            // Le JSON/base64 canonique n'a pas besoin d'espaces internes.
             let bytes = base64::engine::general_purpose::STANDARD
-                .decode(cleaned.as_bytes())
-                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(cleaned.as_bytes()))
+                .decode(b64.as_bytes())
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64.as_bytes()))
                 .context("content_base64 is not valid base64")?;
             if bytes.len() as u64 > MAX_REMOTE_BYTES {
                 return Err(anyhow!("content is over the 100 MB connector limit"));
             }
             tokio::fs::write(&path, bytes).await?;
         } else if let Some(url) = args["url"].as_str() {
-            if !url.starts_with("https://") && !url.starts_with("http://") {
-                return Err(anyhow!("url must be http(s)"));
-            }
-            let resp = self
-                .http
-                .get(url)
-                .send()
-                .await
-                .with_context(|| format!("fetching {url}"))?;
+            let resp = fetch_public_url(url).await?;
             if !resp.status().is_success() {
                 return Err(anyhow!("fetching {url}: HTTP {}", resp.status()));
             }
@@ -1033,6 +1170,45 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         assert_eq!(lifetime_phrase(Some(now + 604_800)), "in 7 days");
+    }
+
+    #[test]
+    fn remote_fetch_rejects_every_non_public_address_family() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "2001::1",
+            "2001:db8::1",
+            "2002:7f00:1::1",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip} must be private");
+        }
+        for ip in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip} must be public");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_requires_https_and_rejects_literal_internal_ips() {
+        let http = reqwest::Url::parse("http://1.1.1.1/file").unwrap();
+        assert!(public_fetch_client(&http).await.is_err());
+        let metadata = reqwest::Url::parse("https://169.254.169.254/latest/meta-data").unwrap();
+        assert!(public_fetch_client(&metadata).await.is_err());
+        let loopback = reqwest::Url::parse("https://[::1]/").unwrap();
+        assert!(public_fetch_client(&loopback).await.is_err());
+        let custom_port = reqwest::Url::parse("https://1.1.1.1:8443/file").unwrap();
+        assert!(public_fetch_client(&custom_port).await.is_err());
     }
 
     #[tokio::test]

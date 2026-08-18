@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Form, Json, Router,
@@ -41,12 +42,21 @@ use yogfile_mcp::{handle, ApiClient};
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 /// Un code d'autorisation vit 5 minutes.
 const CODE_TTL: i64 = 300;
+/// Les refresh OAuth ne survivent jamais au secret d'appareil qu'ils
+/// enveloppent. Cette borne s'applique aussi aux anciens blobs afin
+/// qu'un artefact historique ne reste pas un bearer éternel.
+const REFRESH_TTL: i64 = 90 * 24 * 3600;
 /// Marge retirée à `expires_in` pour que le client rafraîchisse AVANT
 /// que l'API ne refuse le JWT.
 const ACCESS_MARGIN: i64 = 60;
 /// Un token validé auprès de l'API reste réputé bon ce temps-là sans
 /// nouveau round-trip.
 const TOKEN_CACHE: Duration = Duration::from_secs(300);
+/// `content_base64` ajoute 4/3 au plafond produit de 100 Mio, plus
+/// l'enveloppe JSON-RPC. Une seule grosse requête peut être lue en
+/// parallèle afin que ce support ne devienne pas un épuisement mémoire.
+const MAX_MCP_BODY_BYTES: usize = 140 * 1024 * 1024;
+const MAX_MCP_BATCH_ITEMS: usize = 64;
 
 #[derive(Clone)]
 struct App {
@@ -66,6 +76,7 @@ struct App {
     /// Échecs d'autorisation par IP (numéros faux) : la seule surface
     /// d'énumération de ce serveur.
     auth_fails: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
+    large_requests: Arc<tokio::sync::Semaphore>,
 }
 
 #[tokio::main]
@@ -108,10 +119,13 @@ async fn main() -> Result<()> {
         used_codes: Default::default(),
         token_cache: Default::default(),
         auth_fails: Default::default(),
+        large_requests: Arc::new(tokio::sync::Semaphore::new(1)),
     };
 
+    let guarded_mcp = axum::middleware::from_fn_with_state(app.clone(), guard_mcp_request);
     let router = Router::new()
         .route("/", get(root))
+        .route("/oauth.js", get(oauth_javascript))
         .route("/healthz", get(|| async { "ok" }))
         .route("/.well-known/oauth-authorization-server", get(as_metadata))
         .route(
@@ -123,15 +137,29 @@ async fn main() -> Result<()> {
             "/.well-known/oauth-protected-resource/mcp",
             get(rs_metadata),
         )
-        .route("/register", post(register))
-        .route("/authorize", get(authorize_page).post(authorize_submit))
-        .route("/token", post(token))
+        .route(
+            "/register",
+            post(register).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/authorize",
+            get(authorize_page)
+                .post(authorize_submit)
+                .layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/token",
+            post(token).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .route(
             "/mcp",
             post(mcp_post)
                 .get(|| async { (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]) })
-                .delete(|| async { StatusCode::OK }),
+                .delete(|| async { StatusCode::OK })
+                .layer(DefaultBodyLimit::max(MAX_MCP_BODY_BYTES))
+                .layer(guarded_mcp),
         )
+        .layer(axum::middleware::from_fn(security_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(app);
 
@@ -162,6 +190,7 @@ impl App {
             used_codes: Default::default(),
             token_cache: Default::default(),
             auth_fails: Default::default(),
+            large_requests: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -223,14 +252,101 @@ fn sha256_b64url(s: &str) -> String {
     B64.encode(sha2::Sha256::digest(s.as_bytes()))
 }
 
+fn valid_pkce_challenge(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn valid_pkce_verifier(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+}
+
+fn refresh_is_fresh(issued_at: i64, current: i64) -> bool {
+    issued_at <= current + 60 && current.saturating_sub(issued_at) <= REFRESH_TTL
+}
+
 fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
-    // Derrière Caddy : la première IP de X-Forwarded-For est le client.
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(peer)
+    // Seul Caddy en loopback est autorisé à parler au nom du client.
+    // Une connexion directe ne peut donc pas forger son compartiment
+    // de rate-limit avec X-Forwarded-For.
+    if peer.is_loopback() {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .and_then(|v| v.trim().parse().ok())
+        {
+            return forwarded;
+        }
+    }
+    peer
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src https://api.yogfile.com",
+        ),
+    );
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    response
+}
+
+const OAUTH_JAVASCRIPT: &str = r#"const API=document.body.dataset.api;
+const f=document.getElementById('f'),n=document.getElementById('n');
+const create=document.getElementById('create');
+if(create)create.onclick=async(e)=>{
+  const b=e.target;b.disabled=true;b.textContent='Creating…';
+  try{
+    const r=await fetch(API+'/v2/accounts',{method:'POST'});
+    const j=await r.json();
+    if(!r.ok||!j.data){throw new Error((j.error&&j.error.message)||'could not create an account');}
+    n.value=j.data.account_number;
+    document.getElementById('num').textContent='•••• •••• •••• '+j.data.account_number.slice(-4);
+    document.getElementById('pick').classList.add('hide');
+    document.getElementById('made').classList.remove('hide');
+  }catch(err){alert(err.message);b.disabled=false;b.textContent='Create a new account';}
+};
+const copy=document.getElementById('copy');
+if(copy)copy.onclick=(e)=>{const copied=n.value;navigator.clipboard.writeText(copied).then(()=>{e.target.textContent='Copied';setTimeout(async()=>{try{if(await navigator.clipboard.readText()===copied)await navigator.clipboard.writeText('');}catch(_){}},60000);});};
+f.onsubmit=(e)=>{if(n){n.value=n.value.replace(/\D/g,'');if(n.value.length!==16){e.preventDefault();alert('An account number has 16 digits.');}}};"#;
+
+async fn oauth_javascript() -> impl IntoResponse {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        OAUTH_JAVASCRIPT,
+    )
 }
 
 // ───────────────────────── métadonnées ─────────────────────────
@@ -276,11 +392,32 @@ struct ClientBlob {
 }
 
 fn redirect_ok(u: &str) -> bool {
-    if u.starts_with("https://") {
-        return true;
+    let Ok(url) = reqwest::Url::parse(u) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return false;
     }
-    // Les clients de bureau écoutent en local le temps du flux.
-    u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1")
+    match url.scheme() {
+        "https" => url.host_str().is_some(),
+        // Les clients de bureau écoutent en local le temps du flux.
+        "http" => url.host_str().is_some_and(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host);
+            host.eq_ignore_ascii_case("localhost")
+                || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+fn redirect_origin(redirect: &str) -> String {
+    reqwest::Url::parse(redirect)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "an invalid destination".into())
 }
 
 async fn register(State(app): State<App>, Json(body): Json<Value>) -> Response {
@@ -292,7 +429,11 @@ async fn register(State(app): State<App>, Json(body): Json<Value>) -> Response {
                 .collect()
         })
         .unwrap_or_default();
-    if uris.is_empty() || !uris.iter().all(|u| redirect_ok(u)) {
+    if uris.is_empty()
+        || uris.len() > 10
+        || uris.iter().any(|uri| uri.len() > 2048)
+        || !uris.iter().all(|u| redirect_ok(u))
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -302,7 +443,15 @@ async fn register(State(app): State<App>, Json(body): Json<Value>) -> Response {
         )
             .into_response();
     }
-    let name = body["client_name"].as_str().map(str::to_string);
+    let name = body["client_name"].as_str().and_then(|value| {
+        let clean: String = value
+            .trim()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(80)
+            .collect();
+        (!clean.is_empty()).then_some(clean)
+    });
     let blob = ClientBlob {
         r: uris.clone(),
         n: name.clone(),
@@ -382,6 +531,9 @@ struct RefreshBlob {
     /// utilisation réussie émet un nouveau refresh basé sur appareil.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     n: Option<String>,
+    /// sha256(client_id), ajouté lors de la première rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    c: Option<String>,
     t: i64,
     jti: String,
 }
@@ -427,11 +579,16 @@ fn check_authorize(app: &App, q: &AuthorizeQuery) -> Result<(String, String, Str
     if q.code_challenge_method.as_deref().unwrap_or("S256") != "S256" {
         return Err("only S256 PKCE is supported".into());
     }
+    if q.state.as_deref().is_some_and(|state| state.len() > 2048) {
+        return Err("state is too long".into());
+    }
     let challenge = q
         .code_challenge
         .clone()
-        .filter(|c| c.len() >= 43)
         .ok_or("code_challenge (S256) is required")?;
+    if !valid_pkce_challenge(&challenge) {
+        return Err("code_challenge must be a 43-character S256 value".into());
+    }
     Ok((client_id, redirect, challenge))
 }
 
@@ -542,7 +699,7 @@ async fn authorize_submit(
             )
                 .into_response();
         };
-        match api_complete_mfa(&app, &pending.challenge, code, &client_name).await {
+        match api_complete_mfa(&app, &pending.challenge, code, &client_name, ip).await {
             Ok(device) => device,
             Err(_) => {
                 record_fail(&app, ip);
@@ -569,7 +726,7 @@ async fn authorize_submit(
             .filter(|c| c.is_ascii_digit())
             .collect();
         let started = if number.len() == 16 {
-            api_start_session(&app, &number, &client_name).await
+            api_start_session(&app, &number, &client_name, Some(ip)).await
         } else {
             Err(anyhow!("invalid account number"))
         };
@@ -687,16 +844,23 @@ fn urlencode(s: &str) -> String {
 
 /// Autorise le connecteur comme appareil. Le JWT court est volontairement
 /// jeté ici : l'échange OAuth le renouvellera depuis le secret d'appareil.
-async fn api_start_session(app: &App, number: &str, client_name: &str) -> Result<StartedSession> {
-    let resp = app
+async fn api_start_session(
+    app: &App,
+    number: &str,
+    client_name: &str,
+    client_ip: Option<IpAddr>,
+) -> Result<StartedSession> {
+    let mut request = app
         .http
         .post(format!("{}/v2/sessions", app.api))
         .json(&json!({
             "account_number": number,
             "device_name": format!("MCP · {client_name}"),
-        }))
-        .send()
-        .await?;
+        }));
+    if let Some(client_ip) = client_ip {
+        request = request.header("x-forwarded-for", client_ip.to_string());
+    }
+    let resp = request.send().await?;
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     if body["error"]["code"] == "mfa_required" {
@@ -730,6 +894,7 @@ async fn api_complete_mfa(
     challenge: &str,
     code: &str,
     client_name: &str,
+    client_ip: IpAddr,
 ) -> Result<String> {
     let normalized: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let method = if normalized.len() == 6 && normalized.bytes().all(|b| b.is_ascii_digit()) {
@@ -740,6 +905,7 @@ async fn api_complete_mfa(
     let resp = app
         .http
         .post(format!("{}/v2/sessions/mfa", app.api))
+        .header("x-forwarded-for", client_ip.to_string())
         .json(&json!({
             "challenge_id": challenge,
             "method": method,
@@ -766,11 +932,18 @@ async fn api_complete_mfa(
 
 /// Renouvelle le JWT court sans remettre le numéro dans le refresh
 /// token OAuth.
-async fn api_device_session(app: &App, device_token: &str) -> Result<(String, i64, String)> {
+async fn api_device_session(
+    app: &App,
+    device_token: &str,
+    allow_replay_grace: bool,
+) -> Result<(String, i64, String)> {
     let resp = app
         .http
         .post(format!("{}/v2/sessions/refresh", app.api))
-        .json(&json!({ "device_token": device_token }))
+        .json(&json!({
+            "device_token": device_token,
+            "allow_replay_grace": allow_replay_grace,
+        }))
         .send()
         .await?;
     let status = resp.status();
@@ -819,7 +992,7 @@ fn oauth_error(status: StatusCode, code: &str, desc: &str) -> Response {
 }
 
 async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
-    let credential = match f.grant_type.as_str() {
+    let (credential, client_binding, allow_replay_grace) = match f.grant_type.as_str() {
         "authorization_code" => {
             let (Some(code), Some(verifier)) = (f.code.as_deref(), f.code_verifier.as_deref())
             else {
@@ -838,6 +1011,13 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
             if blob.exp < now() {
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "code expired");
             }
+            if !valid_pkce_verifier(verifier) {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "code_verifier has an invalid PKCE shape",
+                );
+            }
             if sha256_b64url(verifier) != blob.ch {
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "PKCE mismatch");
             }
@@ -850,14 +1030,19 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
                     );
                 }
             }
-            if let Some(c) = f.client_id.as_deref() {
-                if sha256_b64url(c) != blob.c {
-                    return oauth_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_client",
-                        "client_id mismatch",
-                    );
-                }
+            let Some(client_id) = f.client_id.as_deref() else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "client_id is required",
+                );
+            };
+            if sha256_b64url(client_id) != blob.c {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_client",
+                    "client_id mismatch",
+                );
             }
             {
                 let mut used = app.used_codes.lock().unwrap();
@@ -878,7 +1063,10 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
                     "authorization code has no account credential",
                 );
             };
-            credential
+            // Un code OAuth est strictement à usage unique. Même après
+            // un redémarrage du connecteur, l'API refusera son ancien
+            // secret d'appareil au lieu d'appliquer la grâce multi-onglet.
+            (credential, blob.c, false)
         }
         "refresh_token" => {
             let Some(rt) = f.refresh_token.as_deref() else {
@@ -888,17 +1076,51 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
                     "refresh_token is required",
                 );
             };
+            let Some(client_id) = f.client_id.as_deref() else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "client_id is required",
+                );
+            };
+            let presented_binding = sha256_b64url(client_id);
+            if app.open::<ClientBlob>("client", client_id).is_err() {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_client",
+                    "unknown client_id",
+                );
+            }
             match app.open::<RefreshBlob>("refresh", rt) {
-                Ok(b) => match oauth_credential(b.d, b.n) {
-                    Some(credential) => credential,
-                    None => {
+                Ok(b) => {
+                    if !refresh_is_fresh(b.t, now()) {
                         return oauth_error(
                             StatusCode::BAD_REQUEST,
                             "invalid_grant",
-                            "refresh token has no account credential",
-                        )
+                            "refresh token expired",
+                        );
                     }
-                },
+                    if b.c
+                        .as_deref()
+                        .is_some_and(|bound| bound != presented_binding)
+                    {
+                        return oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_client",
+                            "client_id mismatch",
+                        );
+                    }
+                    match oauth_credential(b.d, b.n) {
+                        Some(credential) => (credential, presented_binding, true),
+                        None => {
+                            return oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_grant",
+                                "refresh token has no account credential",
+                            )
+                        }
+                    }
+                }
                 Err(_) => {
                     return oauth_error(
                         StatusCode::BAD_REQUEST,
@@ -920,7 +1142,7 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
     let device_token = match credential {
         OAuthCredential::Device(token) => token,
         OAuthCredential::LegacyNumber(number) => {
-            match api_start_session(&app, &number, "MCP connector").await {
+            match api_start_session(&app, &number, "MCP connector", None).await {
                 Ok(StartedSession::Authorized(token)) => token,
                 Ok(StartedSession::MfaRequired { .. }) => {
                     return oauth_error(
@@ -941,24 +1163,26 @@ async fn token(State(app): State<App>, Form(f): Form<TokenForm>) -> Response {
         }
     };
 
-    let (jwt, exp, next_device_token) = match api_device_session(&app, &device_token).await {
-        Ok(v) => v,
-        Err(e) => {
-            // Le compte a disparu (ou l'API est injoignable) : le client
-            // doit refaire le flux complet.
-            tracing::warn!("session for connector failed: {e}");
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "the Yogfile account is not reachable. Reconnect it",
-            );
-        }
-    };
+    let (jwt, exp, next_device_token) =
+        match api_device_session(&app, &device_token, allow_replay_grace).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Le compte a disparu (ou l'API est injoignable) : le client
+                // doit refaire le flux complet.
+                tracing::warn!("session for connector failed: {e}");
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "the Yogfile account is not reachable. Reconnect it",
+                );
+            }
+        };
     let refresh = match app.seal(
         "refresh",
         &RefreshBlob {
             d: Some(next_device_token),
             n: None,
+            c: Some(client_binding),
             t: now(),
             jti: random_id(),
         },
@@ -1026,6 +1250,45 @@ async fn check_token(app: &App, token: &str) -> bool {
     ok
 }
 
+/// Authentifie avant que `Bytes` ne lise jusqu'à 140 Mio et maintient
+/// au plus un gros corps en mémoire. La vérification est retrouvée
+/// dans le cache par `mcp_post`, donc elle ne double pas le trafic API.
+async fn guard_mcp_request(State(app): State<App>, request: Request, next: Next) -> Response {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(token) = token else {
+        return unauthorized(&app, "connect your Yogfile account");
+    };
+    if !check_token(&app, token).await {
+        return unauthorized(&app, "session expired or invalid");
+    }
+    let is_large = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_none_or(|length| length > 2 * 1024 * 1024);
+    if !is_large {
+        return next.run(request).await;
+    }
+    let Ok(permit) = app.large_requests.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "2")],
+            Json(json!({ "error": "server_busy" })),
+        )
+            .into_response();
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
 async fn mcp_post(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Response {
     let token = headers
         .get(header::AUTHORIZATION)
@@ -1052,11 +1315,19 @@ async fn mcp_post(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Re
     };
     let mut client = ApiClient::remote(&app.api, &app.web, token.to_string(), app.http.clone());
     let batch = msg.is_array();
-    let msgs: Vec<Value> = if batch {
-        msg.as_array().cloned().unwrap_or_default()
-    } else {
-        vec![msg]
+    let msgs = match msg {
+        Value::Array(messages) => messages,
+        message => vec![message],
     };
+    if batch && (msgs.is_empty() || msgs.len() > MAX_MCP_BATCH_ITEMS) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "jsonrpc": "2.0", "id": null,
+                "error": { "code": -32600,
+                    "message": "a batch must contain between 1 and 64 requests" } })),
+        )
+            .into_response();
+    }
     let mut out = Vec::new();
     for m in &msgs {
         if let Some(r) = handle(&mut client, m).await {
@@ -1110,6 +1381,7 @@ button:disabled{opacity:.5;cursor:default}
 .num{font-size:28px;font-weight:600;letter-spacing:.14em;font-variant-numeric:tabular-nums;text-align:center;padding:16px;border:2px solid #201e1d;background:#f3f2f2;margin:10px 0;user-select:all}
 .warn{color:#ec3013;font-size:13px}
 .err{border:2px solid #ec3013;color:#ec3013;padding:10px 12px;font-size:13px;margin-bottom:8px}
+.destination{border:1px solid #c9c5c2;background:#f8f7f6;padding:9px 11px;margin:14px 0;font-size:12px;color:#5b5755;overflow-wrap:anywhere}
 .or{display:flex;align-items:center;gap:10px;color:#8a8582;font-size:12px;margin:20px 0 2px}
 .or:before,.or:after{content:"";flex:1;height:2px;background:#e3e0de}
 .hide{display:none}
@@ -1167,11 +1439,12 @@ fn render_authorize(
     };
     let tpl = r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connect Yogfile</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600&display=swap" rel="stylesheet"><style>__CSS__</style></head><body>
+<title>Connect Yogfile</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600&display=swap" rel="stylesheet"><style>__CSS__</style></head><body data-api="__API__">
 <div class="card">
   <div class="brand">__LOGO__</div>
   <h1>Connect Yogfile to __CLIENT__</h1>
   <p>Your agent gets a drive: it can write files, read them back later, and hand out share links. No email or password. A Yogfile account starts with a private 16-digit number and can be protected by MFA.</p>
+  <div class="destination">After approval, you return to <strong>__ORIGIN__</strong>.</div>
   __ERR__
   <form method="post" action="/authorize" id="f">
     <input type="hidden" name="client_id" value="__CID__">
@@ -1182,29 +1455,11 @@ fn render_authorize(
   </form>
   <p style="margin-top:16px"><small>By connecting you accept the <a href="__WEB__/legal/terms">terms</a>. Files stay until you delete them, unless you ask for a lifetime.</small></p>
 </div>
-<script>
-const API="__API__";
-const f=document.getElementById('f'),n=document.getElementById('n');
-const create=document.getElementById('create');
-if(create)create.onclick=async(e)=>{
-  const b=e.target;b.disabled=true;b.textContent='Creating…';
-  try{
-    const r=await fetch(API+'/v2/accounts',{method:'POST'});
-    const j=await r.json();
-    if(!r.ok||!j.data){throw new Error((j.error&&j.error.message)||'could not create an account');}
-    n.value=j.data.account_number;
-    document.getElementById('num').textContent='•••• •••• •••• '+j.data.account_number.slice(-4);
-    document.getElementById('pick').classList.add('hide');
-    document.getElementById('made').classList.remove('hide');
-  }catch(err){alert(err.message);b.disabled=false;b.textContent='Create a new account';}
-};
-const copy=document.getElementById('copy');
-if(copy)copy.onclick=(e)=>{navigator.clipboard.writeText(n.value).then(()=>{e.target.textContent='Copied';});};
-f.onsubmit=(e)=>{if(n){n.value=n.value.replace(/\D/g,'');if(n.value.length!==16){e.preventDefault();alert('An account number has 16 digits.');}}};
-</script></body></html>"#;
+<script src="/oauth.js"></script></body></html>"#;
     tpl.replace("__CSS__", PAGE_CSS)
         .replace("__LOGO__", LOGO_SVG)
         .replace("__CLIENT__", &esc(client_name))
+        .replace("__ORIGIN__", &esc(&redirect_origin(redirect)))
         .replace("__ERR__", &err_html)
         .replace("__FORM__", &form)
         .replace("__CID__", &esc(client_id))
@@ -1243,6 +1498,7 @@ mod mfa_tests {
         let refresh = serde_json::to_value(RefreshBlob {
             d: Some("ydt_secret".into()),
             n: None,
+            c: Some("client".into()),
             t: 1,
             jti: "two".into(),
         })
@@ -1251,6 +1507,7 @@ mod mfa_tests {
         assert!(code.get("n").is_none());
         assert!(refresh.get("n").is_none());
         assert_eq!(code["d"], "ydt_secret");
+        assert_eq!(refresh["c"], "client");
     }
 
     #[test]
@@ -1284,5 +1541,48 @@ mod mfa_tests {
 
         assert!(html.contains("name=\"mfa_code\" type=\"password\""));
         assert!(!html.contains("name=\"account_number\""));
+        assert!(html.contains("https://client.example"));
+        assert!(html.contains("<script src=\"/oauth.js\"></script>"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn redirects_are_parsed_instead_of_prefix_matched() {
+        assert!(redirect_ok("https://client.example/oauth/callback"));
+        assert!(redirect_ok("http://localhost:4318/callback"));
+        assert!(redirect_ok("http://[::1]:4318/callback"));
+        assert!(!redirect_ok("http://localhost.evil.example/callback"));
+        assert!(!redirect_ok("https://client.example/callback#fragment"));
+        assert!(!redirect_ok("https://user@client.example/callback"));
+        assert!(!redirect_ok("file:///tmp/token"));
+    }
+
+    #[test]
+    fn forwarding_is_only_trusted_from_loopback() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert_eq!(
+            client_ip(&headers, "127.0.0.1".parse().unwrap()),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(&headers, "198.51.100.4".parse().unwrap()),
+            "198.51.100.4".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn pkce_and_refresh_lifetimes_are_bounded() {
+        let challenge = "A".repeat(43);
+        assert!(valid_pkce_challenge(&challenge));
+        assert!(!valid_pkce_challenge(&"A".repeat(42)));
+        assert!(!valid_pkce_challenge(&("A".repeat(42) + "=")));
+        assert!(valid_pkce_verifier(&("a".repeat(42) + "~")));
+        assert!(!valid_pkce_verifier(&"a".repeat(129)));
+
+        let current = 2_000_000_000;
+        assert!(refresh_is_fresh(current - REFRESH_TTL, current));
+        assert!(!refresh_is_fresh(current - REFRESH_TTL - 1, current));
+        assert!(!refresh_is_fresh(current + 61, current));
     }
 }
