@@ -332,12 +332,12 @@ fn tool_specs_local() -> Value {
         },
         {
             "name": "delete_file",
-            "title": "Delete a file",
-            "annotations": { "title": "Delete a file", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false },
-            "description": "Delete a file immediately and irreversibly. Its share URL and every \
-                            signed link pointing at it stop working at once. There is no undo and \
-                            no recycle bin, so confirm with the user before calling it on \
-                            anything you did not create in this session.",
+            "title": "Move a file to Trash",
+            "annotations": { "title": "Move a file to Trash", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false },
+            "description": "Move a file to Yogfile Trash. Its share page and every signed link \
+                            pointing at it stop working at once, but the account owner can restore \
+                            it for 30 days before permanent deletion. Confirm with the user before \
+                            calling it on anything you did not create in this session.",
             "inputSchema": { "type": "object", "properties": {
                 "file_id": { "type": "string" }
             }, "required": ["file_id"] }
@@ -1130,7 +1130,8 @@ impl ApiClient {
         )
         .await?;
         Ok(format!(
-            "deleted {file_id}. Its file page and every link pointing at it are dead"
+            "moved {file_id} to Yogfile Trash. Its file page and signed links no longer work; \
+             the account owner can restore it for 30 days"
         ))
     }
 }
