@@ -334,10 +334,12 @@ fn tool_specs_local() -> Value {
             "name": "delete_file",
             "title": "Move a file to Trash",
             "annotations": { "title": "Move a file to Trash", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false },
-            "description": "Move a file to Yogfile Trash. Its share page and every signed link \
-                            pointing at it stop working at once, but the account owner can restore \
-                            it for 30 days before permanent deletion. Confirm with the user before \
-                            calling it on anything you did not create in this session.",
+            "description": "Move a file to Yogfile Trash. Its share page closes immediately and \
+                            no new download link can be issued. A signed capability URL already \
+                            handed out remains valid only until its short expiry (ten minutes by \
+                            default). The account owner can restore the file for 30 days before \
+                            permanent deletion. Confirm with the user before calling it on anything \
+                            you did not create in this session.",
             "inputSchema": { "type": "object", "properties": {
                 "file_id": { "type": "string" }
             }, "required": ["file_id"] }
