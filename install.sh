@@ -25,6 +25,16 @@ die()  { printf "${RED}error:${NC} %s\n" "$1" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1; }
 
+# Dans `curl | sh`, stdin contient le script. Ne pas déclencher un sudo
+# interactif si la sortie n'est pas un terminal et qu'aucun ticket sudo
+# non interactif n'est déjà disponible : l'erreur ferait croire que
+# l'installation a échoué alors que le fallback utilisateur est prévu.
+can_sudo() {
+    [ "${NO_SUDO:-0}" != "1" ] || return 1
+    need sudo || return 1
+    [ -t 1 ] || sudo -n true >/dev/null 2>&1
+}
+
 detect_target() {
     os="$(uname -s)"
     arch="$(uname -m)"
@@ -96,7 +106,7 @@ place_binary() {
     src="$1"
     if [ -w "$INSTALL_DIR" ] || mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
         mv "$src" "${INSTALL_DIR}/${BINARY}"
-    elif [ "${NO_SUDO:-0}" != "1" ] && need sudo \
+    elif can_sudo \
         && { info "writing to ${INSTALL_DIR} (needs sudo)"; sudo mkdir -p "$INSTALL_DIR" \
              && sudo mv "$src" "${INSTALL_DIR}/${BINARY}" \
              && sudo chmod 755 "${INSTALL_DIR}/${BINARY}"; }; then

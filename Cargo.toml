@@ -1,9 +1,9 @@
 [package]
 name = "yogfile-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "AGPL-3.0"
-description = "Yogfile for AI agents: an MCP server that uploads files and hands back share links that expire"
+description = "Yogfile for AI agents: a durable drive over MCP with direct uploads and share links"
 repository = "https://github.com/sifrah/yogfile-mcp"
 
 [lib]

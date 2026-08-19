@@ -66,7 +66,7 @@ kept in the local state file and renews daily sessions automatically.
 | `share_link` | mint a fresh short-lived download link for a file |
 | `list_files` | list what's in a drive (folders included) |
 | `create_folder` | create a folder path in a drive |
-| `delete_file` | move a file to Yogfile Trash; public access stops immediately and the owner can restore it for 30 days |
+| `delete_file` | move a file to Yogfile Trash; its page closes immediately, issued capability URLs remain valid only until their short expiry, and the owner can restore it for 30 days |
 | `create_drive` | create a drive: a named place that outlives the session, holding folders and files |
 | `create_account` | local binary only: force a new account (one is created automatically otherwise) |
 
@@ -76,6 +76,11 @@ policy you ask for, not a default: `default_ttl_secs` on a drive,
 `ttl_secs` on a single upload, and a sweeper honours the date. Files
 never transit through the Yogfile API — the agent talks to the storage
 nodes directly with signed headers.
+
+Moving a file to Trash disables its stable page and prevents any new
+download link from being minted. A signed capability URL already handed
+to someone is autonomous and remains usable only until the expiry embedded
+in that URL (ten minutes by default).
 
 ## Running the connector yourself
 
