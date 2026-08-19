@@ -66,15 +66,16 @@ kept in the local state file and renews daily sessions automatically.
 | `share_link` | mint a fresh short-lived download link for a file |
 | `list_files` | list what's in a drive (folders included) |
 | `create_folder` | create a folder path in a drive |
-| `delete_file` | delete a file now |
+| `delete_file` | move a file to Yogfile Trash; public access stops immediately and the owner can restore it for 30 days |
 | `create_drive` | create a drive: a named place that outlives the session, holding folders and files |
 | `create_account` | local binary only: force a new account (one is created automatically otherwise) |
 
-Files stay until someone deletes them. A lifetime is a policy you ask
-for, not a default: `default_ttl_secs` on a drive, `ttl_secs` on a
-single upload, and a sweeper honours the date. Files never transit
-through the Yogfile API — the agent talks to the storage nodes
-directly with signed headers.
+Files stay until someone deletes them. Deleted files spend 30 days in
+Yogfile Trash unless the owner purges them sooner. A lifetime is a
+policy you ask for, not a default: `default_ttl_secs` on a drive,
+`ttl_secs` on a single upload, and a sweeper honours the date. Files
+never transit through the Yogfile API — the agent talks to the storage
+nodes directly with signed headers.
 
 ## Running the connector yourself
 
